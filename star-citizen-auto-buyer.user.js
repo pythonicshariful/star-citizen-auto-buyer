@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.1.2
+// @version      1.2.0
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,18 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.1.2
+ * Star Citizen Auto Buyer — v1.2.0
  * =================================
+ * v1.2.0 (2026-11-21): ANY product can be watched now, not just ships.
+ *   The panel has an "Add any product" form — paste any RSI store
+ *   product URL (ship, package, vehicle…), set a max price, and the bot
+ *   watches it. No code editing anymore. Entries carry an optional
+ *   store-list ID (ships: 72 = Standalone Ships): with one, the bot
+ *   also checks the product by API from any page; without one, the
+ *   product is "page only" — the bot watches its Buy Now button, so
+ *   its page must stay open in a tab. The DOM Buy Now path now also
+ *   respects the max price: if the price shown on the page is above
+ *   your max, it does NOT click. Kraken is still the default entry.
  * v1.1.2 FIX (2026-11-21): Start Monitor -> Buy Now never fired for
  *   "Name - 10 Year" ships (PTV - 10 Year, Meteor - 10 Year — the
  *   in-stock test products). The old page check turned "PTV - 10 Year"
@@ -72,6 +82,18 @@
  *   A Warbond SKU (cheaper, e.g. Kraken Warbond $1400 vs standard $1650)
  *   is preferred when "Prefer Warbond" is on.
  *
+ * ANY PRODUCT (v1.2.0) — not just ships:
+ *   The watchlist can hold ANY RSI store product: a ship, a package
+ *   (e.g. First Flight Pack), a vehicle — anything with a Buy Now
+ *   button. Add it from the panel, no code editing. Each entry has a
+ *   max price (hard cap, never bought above it) and an OPTIONAL
+ *   store-list ID. With a list ID (ships: 72 = Standalone Ships) the
+ *   bot checks the product by API from any RSI page. Without one the
+ *   product is "page only": the bot can only see its Buy Now button,
+ *   so that product's page must stay open in a tab while monitoring.
+ *   The DOM Buy Now path also checks the price shown on the page
+ *   against your max — above max, it does not click.
+ *
  * SAFETY — READ THIS:
  *   - "Auto-Pay / Place Order" is OFF by default. When OFF the bot stops
  *     at the payment step, sounds an alarm and waits for YOU to pay.
@@ -86,9 +108,14 @@
  *
  * TEST IT SAFELY FIRST (no purchase):
  *   Press "Test stock check now" in the panel. It runs ONE API check for
- *   every watched ship and shows the result. Try it with an in-stock
- *   ship first (e.g. add "PTV - 10 Year", $15, product 72) — you should
- *   see IN STOCK without anything being added to your cart.
+ *   every watched product that has a list ID, and shows the result.
+ *   Try it with an in-stock ship first (add "PTV - 10 Year", $15,
+ *   list 72, from the panel) — you should see IN STOCK without
+ *   anything being added to your cart. To test the Buy Now click
+ *   itself, add a cheap in-stock product (e.g. First Flight Pack,
+ *   $60 — no list ID needed), open its own page, press Start: the
+ *   bot clicks Buy Now and takes you to the cart, then stops at
+ *   payment (Auto-Pay is OFF), so nothing is bought.
  */
 
 'use strict';
@@ -447,32 +474,119 @@ function slugify(s) {
 }
 
 /**
- * True when the current page is one of the watched ships' pages.
- * v1.1.1 BUG (fixed in v1.1.2): the old check slugified the ship name
- * with name.replace(/\s+/g, '-'), which turns "PTV - 10 Year" into
- * "ptv---10-year" — but the real RSI page is ".../PTV-10-Year", so
- * the DOM Buy Now click never fired for any "Name - 10 Year" ship
- * (exactly the in-stock test products). Matching now slugifies the
- * name AND the URL the same way, and also matches the watchlist
- * entry's own URL (its last path segment).
+ * True when `url` is this ONE entry's own product page.
+ * v1.1.2: slugifies the name AND the URL the same way, and also
+ * matches the entry's own URL (its last path segment). Works for any
+ * product — ship, package, vehicle — not just ships.
  */
+function entryMatchesPage(entry, url) {
+  if (!entry || !url) return false;
+  const u = String(url).toLowerCase();
+  if (entry.url) {
+    try {
+      const path = new URL(String(entry.url)).pathname.toLowerCase();
+      const last = path.split('/').filter(Boolean).pop() || '';
+      if (last && u.includes(last)) return true;
+      if (path && u.includes(path)) return true;
+    } catch (e) { /* bad URL in config — fall through to name match */ }
+  }
+  const name = slugify(entry.name);
+  return !!(name && u.includes(name));
+}
+
+/** True when the current page is any watched product's page. */
 function isWatchedPage(url, watchlist) {
   const u = String(url || '').toLowerCase();
   if (!u) return false;
-  const list = watchlist || [];
-  for (const w of list) {
-    if (w.url) {
-      try {
-        const path = new URL(String(w.url)).pathname.toLowerCase();
-        const last = path.split('/').filter(Boolean).pop() || '';
-        if (last && u.includes(last)) return true;
-        if (path && u.includes(path)) return true;
-      } catch (e) { /* bad URL in config — fall through to name match */ }
-    }
-    const name = slugify(w.name);
-    if (name && u.includes(name)) return true;
+  return (watchlist || []).some((w) => entryMatchesPage(w, u));
+}
+
+/** True when the string is an RSI pledge-store page URL. */
+function isRsiUrl(url) {
+  try {
+    const u = new URL(String(url || '').trim());
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    if (!/robertsspaceindustries\.com$/.test(u.hostname.toLowerCase())) return false;
+    return u.pathname.toLowerCase().indexOf('/pledge/') !== -1;
+  } catch (e) { return false; }
+}
+
+/**
+ * Validate + normalise one watchlist entry typed into the panel
+ * (v1.2.0 — any product, not just ships).
+ * Input: { name?, url, maxPrice, productId?, preferWarbond? }.
+ *   - url: required, must be an RSI pledge-store page. The name is
+ *     read from the URL when left empty ("Star-Citizen-First-Flight-
+ *     Pack" -> "Star Citizen First Flight Pack").
+ *   - maxPrice: required, USD, above 0 — the hard cap.
+ *   - productId: optional, digits only. Empty means "page only": the
+ *     bot cannot check this product by API, it only watches its
+ *     Buy Now button — so its page must stay open in a tab.
+ *   - qty is always 1 (RSI's one-per-account limit).
+ * Returns { entry } or { error } (plain words for the panel).
+ */
+function normalizeWatchEntry(raw) {
+  const r = raw || {};
+  const url = String(r.url || '').trim();
+  if (!url) return { error: 'Paste the product URL from the RSI store.' };
+  if (!isRsiUrl(url)) return { error: 'That is not an RSI pledge-store page — copy the URL from robertsspaceindustries.com.' };
+  let name = String(r.name || '').trim();
+  if (!name) {
+    name = parseShipNameFromUrl(url) || '';
+    if (!name) return { error: 'Type a product name — it could not be read from the URL.' };
   }
-  return false;
+  const maxPrice = Number(r.maxPrice);
+  if (!isFinite(maxPrice) || maxPrice <= 0) return { error: 'Max price must be a number above 0 (USD).' };
+  let productId = (r.productId === undefined || r.productId === null) ? '' : String(r.productId).trim();
+  if (productId && !/^\d+$/.test(productId)) return { error: 'List ID must be digits only (e.g. 72) — or leave it empty.' };
+  if (!productId) productId = null;
+  return {
+    entry: {
+      name: name,
+      url: url,
+      productId: productId,
+      maxPrice: maxPrice,
+      preferWarbond: r.preferWarbond === true,
+      qty: 1,
+    },
+  };
+}
+
+/** True when the entry can be checked via the API (it has a store-list ID). */
+function isApiCheckable(entry) {
+  return !!(entry && entry.productId !== null && entry.productId !== undefined &&
+    String(entry.productId).trim() !== '' && /^\d+$/.test(String(entry.productId)));
+}
+
+/** Read the price (USD) off the current product page's JSON-LD, if it has one. Returns a number or null. */
+function pagePriceUsd(doc) {
+  try {
+    const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
+    for (const el of scripts) {
+      const data = JSON.parse(el.textContent || '{}');
+      const offers = data && data.offers ? data.offers : null;
+      if (!offers) continue;
+      const p = offers.price;
+      if (p === undefined || p === null) continue;
+      const n = Number(String(p).replace(/[^0-9.]/g, ''));
+      if (isFinite(n) && n > 0) return n;
+    }
+  } catch (e) { /* malformed JSON-LD — no price */ }
+  return null;
+}
+
+/**
+ * May the DOM Buy Now path click for this entry at this page price?
+ *   - price unknown (null): allowed, as before — the API check is the
+ *     strict cap, the DOM path is the fast path when the API lags.
+ *   - price at/under maxPrice: allowed.
+ *   - price above maxPrice: NOT allowed — never buy above the cap.
+ */
+function domBuyAllowed(entry, pagePrice) {
+  if (!entry) return { allowed: false, reason: 'no_entry' };
+  if (pagePrice === null || pagePrice === undefined) return { allowed: true, reason: 'price_unknown' };
+  if (pagePrice <= Number(entry.maxPrice)) return { allowed: true, reason: 'under_cap' };
+  return { allowed: false, reason: 'over_max_price' };
 }
 
 /* ------------------------------------------------------------------ */
@@ -624,13 +738,26 @@ function findBuyNowButton(doc) {
   return null;
 }
 
-/** If a Buy Now button is available on a watched ship page, click it human-like. */
+/** If a Buy Now button is available on a watched product's page, click it human-like. */
 async function clickBuyNowIfAvailable() {
   if (!BOT.config.humanClick) return false;
-  if (!isWatchedPage(window.location.href, BOT.config.watchlist)) return false;
+  // v1.2.0: match by the entry's own URL, so ANY watchlisted product
+  // (ship, package, vehicle) clicks on its own page — and a product
+  // that is NOT in the watchlist never clicks.
+  const entry = (BOT.config.watchlist || []).find((w) => entryMatchesPage(w, window.location.href));
+  if (!entry) return false;
   const btn = findBuyNowButton(document);
   if (!btn) return false;
-  log('Buy Now button is available on this page — clicking it with random human-like mouse movement…');
+  // v1.2.0: respect the max price on the DOM path too. If the price
+  // shown on the page is above the cap, do NOT click.
+  const price = pagePriceUsd(document);
+  const gate = domBuyAllowed(entry, price);
+  if (!gate.allowed) {
+    log(entry.name + ': page price is $' + price + ', above your max $' + entry.maxPrice + ' — NOT clicking Buy Now.');
+    return false;
+  }
+  if (gate.reason === 'price_unknown') log(entry.name + ': page price could not be read — clicking per your max $' + entry.maxPrice + ' (the API check is the strict cap).');
+  log('Buy Now button is available for ' + entry.name + ' — clicking it with random human-like mouse movement…');
   const ok = await humanClick(btn);
   if (ok) log('Buy Now clicked (human-like path).');
   return ok;
@@ -652,8 +779,13 @@ async function gql(body) {
   return res.json();
 }
 
-/** One stock check for one watched ship. Returns { ship, sku, reason }. */
+/** One stock check for one watched product. Returns { ship, sku, reason }. */
 async function checkOneShip(ship) {
+  // v1.2.0: entries without a store-list ID are "page only" — the API
+  // cannot check them, the DOM Buy Now path on their own page does.
+  if (!isApiCheckable(ship)) {
+    return { ship: ship, sku: null, reason: 'page_only', checkedSkus: 0 };
+  }
   const body = buildStockQuery(ship.productId, 1000);
   const json = await gql(body);
   if (json && json.errors && json.errors.length) {
@@ -670,6 +802,10 @@ async function checkAllShips() {
   for (const ship of BOT.config.watchlist) {
     try {
       const r = await checkOneShip(ship);
+      if (r.reason === 'page_only') {
+        log(ship.name + ': page-only (no list ID) — keep its product page open; the bot watches its Buy Now button there.');
+        continue;
+      }
       if (r.reason === 'in_stock' && r.sku) {
         const price = priceUsd(r.sku.price.amount);
         log('IN STOCK: ' + r.sku.title + ' — $' + price + ' (SKU ' + r.sku.id + ', warbond=' + r.sku.isWarbond + ')');
@@ -795,12 +931,16 @@ async function checkoutStepHandler() {
   setTimeout(checkoutStepHandler, 4000);
 }
 
-/** Dry-run: one API stock check per watched ship, nothing added to cart. */
+/** Dry-run: one API stock check per watched product with a list ID, nothing added to cart. */
 async function testStockCheck() {
   log('TEST: one dry-run stock check (nothing will be added to the cart)…');
   try {
     for (const ship of BOT.config.watchlist) {
       const r = await checkOneShip(ship);
+      if (r.reason === 'page_only') {
+        log('TEST ' + ship.name + ': page-only (no list ID) — the API cannot check it. Open its product page and press Start; the bot watches the Buy Now button there.');
+        continue;
+      }
       const price = r.sku ? '$' + priceUsd(r.sku.price.amount) : '—';
       log('TEST ' + ship.name + ': ' + r.reason + (r.sku ? ' — ' + r.sku.title + ' ' + price : '') + ' (' + r.checkedSkus + ' SKUs)');
     }
@@ -811,6 +951,76 @@ async function testStockCheck() {
 }
 
 /* ------------------------- control panel ------------------------- */
+
+function escHtml(s) {
+  return String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** Re-draw the watchlist with a Remove button per product (v1.2.0). */
+function renderWatchlist() {
+  if (!isBrowser) return;
+  const shipsEl = document.getElementById('scab-ships');
+  if (!shipsEl) return;
+  const list = BOT.config.watchlist || [];
+  if (list.length === 0) {
+    shipsEl.innerHTML = '<div>No products in the watchlist — add one below.</div>';
+    return;
+  }
+  shipsEl.innerHTML = list.map((w, i) =>
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">' +
+    '<span>• <b>' + escHtml(w.name) + '</b> — max $' + escHtml(w.maxPrice) +
+    (w.preferWarbond ? ' (Warbond first)' : '') +
+    (isApiCheckable(w) ? ' — list ' + escHtml(w.productId) : ' — page only') + '</span>' +
+    '<button data-scab-remove="' + i + '" title="Remove" style="flex:none;padding:1px 7px;border:0;border-radius:6px;background:#7f1d1d;color:#fff;cursor:pointer;">✕</button></div>'
+  ).join('');
+  shipsEl.querySelectorAll('[data-scab-remove]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.getAttribute('data-scab-remove'));
+      const removed = BOT.config.watchlist[idx];
+      BOT.config.watchlist.splice(idx, 1);
+      saveConfig();
+      renderWatchlist();
+      log('Removed from watchlist: ' + (removed ? removed.name : '?'));
+    });
+  });
+}
+
+/** Wire the "Add any product" form (v1.2.0). */
+function bindWatchlistForm() {
+  if (!isBrowser) return;
+  const btn = document.getElementById('scab-add-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const msgEl = document.getElementById('scab-add-msg');
+    const setMsg = (t, ok) => { if (msgEl) { msgEl.textContent = t; msgEl.style.color = ok ? '#4ade80' : '#f87171'; } };
+    const urlEl = document.getElementById('scab-add-url');
+    const nameEl = document.getElementById('scab-add-name');
+    const priceEl = document.getElementById('scab-add-price');
+    const listEl = document.getElementById('scab-add-list');
+    const warbondEl = document.getElementById('scab-add-warbond');
+    const res = normalizeWatchEntry({
+      url: urlEl ? urlEl.value : '',
+      name: nameEl ? nameEl.value : '',
+      maxPrice: priceEl ? priceEl.value : '',
+      productId: listEl ? listEl.value : '',
+      preferWarbond: warbondEl ? warbondEl.checked : false,
+    });
+    if (res.error) { setMsg(res.error, false); return; }
+    const entry = res.entry;
+    const dupe = (BOT.config.watchlist || []).some((w) => String(w.url || '').toLowerCase() === entry.url.toLowerCase());
+    if (dupe) { setMsg('That product is already in the watchlist.', false); return; }
+    BOT.config.watchlist.push(entry);
+    saveConfig();
+    renderWatchlist();
+    if (urlEl) urlEl.value = '';
+    if (nameEl) nameEl.value = '';
+    if (priceEl) priceEl.value = '';
+    if (listEl) listEl.value = '';
+    if (warbondEl) warbondEl.checked = false;
+    setMsg('Added: ' + entry.name + ' (max $' + entry.maxPrice + ')' + (isApiCheckable(entry) ? '' : ' — page only, keep its page open.'), true);
+    log('Added to watchlist: ' + entry.name + ' (max $' + entry.maxPrice + ')' + (isApiCheckable(entry) ? ' — list ' + entry.productId : ' — page only'));
+  });
+}
 
 function renderLog() {
   if (!isBrowser) return;
@@ -825,22 +1035,32 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-    '<b>🚀 SC Auto Buyer v1.1.2</b>' +
+    '<b>🚀 SC Auto Buyer v1.2.0</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
     '<button id="scab-start" style="flex:1;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;">▶ Start monitoring</button>' +
     '<button id="scab-stop" style="flex:1;padding:7px;border:0;border-radius:6px;background:#475569;color:#fff;cursor:pointer;">⏸ Stop</button></div>' +
     '<button id="scab-test" style="width:100%;margin-top:6px;padding:7px;border:0;border-radius:6px;background:#0e7490;color:#fff;cursor:pointer;">🔍 Test stock check now (no purchase)</button>' +
+    '<div style="margin-top:10px;border-top:1px solid #334155;padding-top:8px;">' +
+    '<b style="font-size:12px;">➕ Add any product</b>' +
+    '<div style="font-size:11px;color:#94a3b8;">Any ship, package or vehicle — paste its RSI page URL. No code editing.</div>' +
+    '<input id="scab-add-url" placeholder="Product URL — paste from the RSI store" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
+    '<input id="scab-add-name" placeholder="Name (optional — filled in from the URL)" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
+    '<div style="display:flex;gap:6px;margin-top:6px;">' +
+    '<input id="scab-add-price" type="number" min="1" step="0.01" placeholder="Max price $" style="flex:1;min-width:0;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
+    '<input id="scab-add-list" placeholder="List ID (optional, e.g. 72)" style="flex:1;min-width:0;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;"></div>' +
+    '<label style="display:block;margin-top:6px;font-size:12px;"><input type="checkbox" id="scab-add-warbond"> Prefer Warbond (cheaper version first)</label>' +
+    '<button id="scab-add-btn" style="width:100%;margin-top:6px;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;">Add product</button>' +
+    '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
+    '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
     '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order (OFF = bot stops at payment)</label>' +
     '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed.</div>' +
     '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>';
   document.body.appendChild(panel);
 
-  const shipsEl = document.getElementById('scab-ships');
-  shipsEl.innerHTML = BOT.config.watchlist.map((w) =>
-    '<div>• <b>' + w.name + '</b> — max $' + w.maxPrice + (w.preferWarbond ? ' (Warbond first)' : '') + ' — list ' + w.productId + '</div>'
-  ).join('') || '<div>No ships in the watchlist.</div>';
+  renderWatchlist();
+  bindWatchlistForm();
 
   const payBox = document.getElementById('scab-autopay');
   payBox.checked = !!BOT.config.autoPay;
@@ -879,5 +1099,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildNextStepMutation, nextDelayMs, detectBlocker, availabilityFromJsonLd,
     randInt, randomPointInRect, humanPath, BUY_NOW_SELECTORS, isClickableEl,
     slugify, isWatchedPage, findBuyNowButton,
+    entryMatchesPage, isRsiUrl, normalizeWatchEntry, isApiCheckable,
+    pagePriceUsd, domBuyAllowed,
   };
 }
