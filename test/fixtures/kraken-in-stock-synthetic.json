@@ -1,0 +1,75 @@
+{
+ "data": {
+  "store": {
+   "search": {
+    "count": 1,
+    "resources": [
+     {
+      "id": "72",
+      "title": "Standalone Ships",
+      "name": "Standalone Ships",
+      "skus": [
+       {
+        "id": "16427",
+        "slug": "9vyn0edx7a2df",
+        "title": "Syulen",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": true,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 0,
+         "backOrderQty": 0,
+         "level": "high"
+        },
+        "price": {
+         "amount": 7000,
+         "discounted": null
+        }
+       },
+       {
+        "id": "19999",
+        "slug": "kraken-warbond-test",
+        "title": "Kraken - 10 Year",
+        "isWarbond": true,
+        "stock": {
+         "unlimited": false,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 12,
+         "backOrderQty": 0,
+         "level": "low"
+        },
+        "price": {
+         "amount": 140000,
+         "discounted": null
+        }
+       },
+       {
+        "id": "20000",
+        "slug": "kraken-std-test",
+        "title": "Kraken - 10 Year",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": false,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 8,
+         "backOrderQty": 0,
+         "level": "low"
+        },
+        "price": {
+         "amount": 165000,
+         "discounted": null
+        }
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

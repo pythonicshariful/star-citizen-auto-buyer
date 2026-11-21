@@ -1,0 +1,116 @@
+{
+ "run_at_utc": "2026-11-21T07:02:30.928283+00:00",
+ "endpoint": "https://robertsspaceindustries.com/graphql",
+ "checks": [
+  {
+   "name": "Kraken in product 72 (Standalone Ships)",
+   "http": 200,
+   "seconds": 0.98,
+   "skus_in_list": 213,
+   "kraken_skus_found": 0,
+   "verdict": "NOT_LISTED \u2014 Kraken is not in the store list while out of stock (expected 2026-11-21; it appears here when a wave goes live)",
+   "in_stock_count": 209
+  },
+  {
+   "name": "PTV - 10 Year (in-stock test product, sku 17209)",
+   "http": 200,
+   "seconds": 0.98,
+   "sku": {
+    "id": "17209",
+    "slug": "g1edfe6jnb6tu",
+    "title": "PTV - 10 Year",
+    "isWarbond": false,
+    "stock": {
+     "unlimited": true,
+     "show": true,
+     "available": true,
+     "backOrder": false,
+     "qty": 0,
+     "backOrderQty": 0,
+     "level": "high"
+    },
+    "price": {
+     "amount": 1500,
+     "discounted": null
+    }
+   },
+   "verdict": "IN_STOCK",
+   "note": "Bot's findTargetSku logic returns this SKU under a $20 cap \u2014 proves the stock-check path works end to end. NOTHING was added to any cart."
+  },
+  {
+   "name": "Star Citizen First Flight Pack (product 45, sku 19607)",
+   "http": 200,
+   "seconds": 0.42,
+   "sku": {
+    "id": "19607",
+    "slug": "9sk6qqr5oha6u",
+    "title": "Star Citizen First Flight Pack",
+    "isWarbond": false,
+    "stock": {
+     "unlimited": true,
+     "show": true,
+     "available": true,
+     "backOrder": false,
+     "qty": 0,
+     "backOrderQty": 0,
+     "level": "high"
+    },
+    "price": {
+     "amount": 6000,
+     "discounted": null
+    }
+   },
+   "verdict": "IN_STOCK"
+  },
+  {
+   "name": "Pioneer - 10 Year (negative control, expect OOS)",
+   "skus": [
+    {
+     "id": "17219",
+     "slug": "jtoandv973ym3",
+     "title": "Pioneer - 10 Year",
+     "isWarbond": true,
+     "stock": {
+      "unlimited": false,
+      "show": false,
+      "available": false,
+      "backOrder": false,
+      "qty": null,
+      "backOrderQty": null,
+      "level": "none"
+     },
+     "price": {
+      "amount": 82500,
+      "discounted": null
+     }
+    },
+    {
+     "id": "17220",
+     "slug": "adbztmdqj41ae",
+     "title": "Pioneer - 10 Year",
+     "isWarbond": false,
+     "stock": {
+      "unlimited": false,
+      "show": false,
+      "available": false,
+      "backOrder": false,
+      "qty": null,
+      "backOrderQty": null,
+      "level": "none"
+     },
+     "price": {
+      "amount": 92500,
+      "discounted": null
+     }
+    }
+   ],
+   "verdict": "OUT_OF_STOCK"
+  },
+  {
+   "name": "Kraken pledge page JSON-LD",
+   "price_usd": "1650.00",
+   "availability": "OutOfStock",
+   "verdict": "OUT_OF_STOCK on page, $1650 standard price (buyer quoted $1400 Warbond)"
+  }
+ ]
+}

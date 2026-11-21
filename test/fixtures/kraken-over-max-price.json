@@ -1,0 +1,37 @@
+{
+ "data": {
+  "store": {
+   "search": {
+    "count": 1,
+    "resources": [
+     {
+      "id": "72",
+      "title": "Standalone Ships",
+      "name": "Standalone Ships",
+      "skus": [
+       {
+        "id": "20000",
+        "slug": "kraken-std-test",
+        "title": "Kraken - 10 Year",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": false,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 8,
+         "backOrderQty": 0,
+         "level": "low"
+        },
+        "price": {
+         "amount": 165000,
+         "discounted": null
+        }
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}

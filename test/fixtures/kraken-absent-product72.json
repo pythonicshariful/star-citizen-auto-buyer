@@ -1,0 +1,132 @@
+{
+ "data": {
+  "store": {
+   "search": {
+    "count": 1,
+    "resources": [
+     {
+      "id": "72",
+      "title": "Standalone Ships",
+      "name": "Standalone Ships",
+      "skus": [
+       {
+        "id": "16427",
+        "slug": "9vyn0edx7a2df",
+        "title": "Syulen",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": true,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 0,
+         "backOrderQty": 0,
+         "level": "high"
+        },
+        "price": {
+         "amount": 7000,
+         "discounted": null
+        }
+       },
+       {
+        "id": "17209",
+        "slug": "g1edfe6jnb6tu",
+        "title": "PTV - 10 Year",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": true,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 0,
+         "backOrderQty": 0,
+         "level": "high"
+        },
+        "price": {
+         "amount": 1500,
+         "discounted": null
+        }
+       },
+       {
+        "id": "17219",
+        "slug": "jtoandv973ym3",
+        "title": "Pioneer - 10 Year",
+        "isWarbond": true,
+        "stock": {
+         "unlimited": false,
+         "show": false,
+         "available": false,
+         "backOrder": false,
+         "qty": null,
+         "backOrderQty": null,
+         "level": "none"
+        },
+        "price": {
+         "amount": 82500,
+         "discounted": null
+        }
+       },
+       {
+        "id": "17220",
+        "slug": "adbztmdqj41ae",
+        "title": "Pioneer - 10 Year",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": false,
+         "show": false,
+         "available": false,
+         "backOrder": false,
+         "qty": null,
+         "backOrderQty": null,
+         "level": "none"
+        },
+        "price": {
+         "amount": 92500,
+         "discounted": null
+        }
+       },
+       {
+        "id": "19620",
+        "slug": "n6m4r4ip71i3h",
+        "title": "Galaxy - 10 Year",
+        "isWarbond": false,
+        "stock": {
+         "unlimited": true,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 0,
+         "backOrderQty": 0,
+         "level": "high"
+        },
+        "price": {
+         "amount": 40000,
+         "discounted": null
+        }
+       },
+       {
+        "id": "19830",
+        "slug": "f5pvgsj8g7jup",
+        "title": "Galaxy - 10 Year",
+        "isWarbond": true,
+        "stock": {
+         "unlimited": true,
+         "show": true,
+         "available": true,
+         "backOrder": false,
+         "qty": 0,
+         "backOrderQty": 0,
+         "level": "high"
+        },
+        "price": {
+         "amount": 36000,
+         "discounted": null
+        }
+       }
+      ]
+     }
+    ]
+   }
+  }
+ }
+}
