@@ -107,13 +107,22 @@ function fakeEl(o) {
     tagName: (o.tag || 'DIV').toUpperCase(),
     src: o.src || '',
     className: o.cls || '',
+    textContent: o.text || '',
+    disabled: !!o.disabled,
     _sitekey: o.sitekey || null,
+    _testid: o.testid || null,
+    _arialabel: o.arialabel || null,
+    _cyid: o.cyid || null,
     offsetParent: o.hidden ? null : {},
-    _rect: o.rect || { width: 300, height: 65 },
+    // A hidden element has a 0-size rect in a real browser.
+    _rect: o.hidden ? { width: 0, height: 0 } : (o.rect || { width: 300, height: 65 }),
     getBoundingClientRect: function () { return this._rect; },
     getAttribute: function (n) {
       if (n === 'src') return this.src || null;
       if (n === 'data-sitekey') return this._sitekey;
+      if (n === 'data-testid') return this._testid;
+      if (n === 'aria-label') return this._arialabel;
+      if (n === 'data-cy-id') return this._cyid;
       return null;
     },
     closest: function (sel) { return (o.inBadge && sel === '.grecaptcha-badge') ? { className: 'grecaptcha-badge' } : null; },
@@ -131,6 +140,12 @@ function fakeDoc(o) {
     if (sel === '.h-captcha') return (el.className || '').split(/\s+/).indexOf('h-captcha') !== -1;
     if (sel === '.cf-turnstile') return (el.className || '').split(/\s+/).indexOf('cf-turnstile') !== -1;
     if (sel === '[data-sitekey]') return !!el._sitekey;
+    // Buy Now selectors (v1.1.2 section 10).
+    if (sel === '[data-testid="express-buy-now"]') return el.getAttribute('data-testid') === 'express-buy-now';
+    if (sel === 'button[aria-label="Buy Now"]') return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Buy Now';
+    if (sel === '.a-buyNowButton' || sel === '.m-storeAction__buyNow') return (el.className || '').split(/\s+/).indexOf(sel.slice(1)) !== -1;
+    if (sel === 'button[data-cy-id="button"]') return el.tagName === 'BUTTON' && el.getAttribute('data-cy-id') === 'button';
+    if (sel === 'button') return el.tagName === 'BUTTON';
     return false;
   }
   return {
@@ -203,6 +218,41 @@ check('script defines humanClick + humanMoveTo + findBuyNowButton', SRC.includes
 check('humanClick dispatches mousemove / mousedown / mouseup / click with random delays', SRC.includes("'mousemove'") && SRC.includes("'mousedown'") && SRC.includes("'mouseup'") && SRC.includes("'click'") && SRC.includes('randInt(8, 30)') && SRC.includes('randInt(80, 350)'));
 check('Place Order uses humanClick, not instant btn.click()', !/btn\.click\s*\(\)/.test(SRC) && SRC.includes('await humanClick(btn)'));
 check('loop checks DOM Buy Now before API (fallback if API lags)', SRC.includes('clickBuyNowIfAvailable()'));
+
+console.log('== 10. Start Monitor -> Buy Now path (v1.1.2) ==');
+var PTV = { name: 'PTV - 10 Year', url: 'https://robertsspaceindustries.com/en/pledge/Standalone-Ships/PTV-10-Year', productId: '72', maxPrice: 20, preferWarbond: false, qty: 1 };
+var PTV_URL = 'https://robertsspaceindustries.com/en/pledge/Standalone-Ships/PTV-10-Year';
+var METEOR = { name: 'Meteor - 10 Year', url: 'https://robertsspaceindustries.com/en/pledge/Standalone-Ships/Meteor-10-Year', productId: '72', maxPrice: 300, preferWarbond: false, qty: 1 };
+// REGRESSION: the v1.1.1 page gate turned "PTV - 10 Year" into
+// "ptv---10-year", which the real ".../PTV-10-Year" URL never contains,
+// so the DOM Buy Now click never fired for any "Name - 10 Year" ship.
+check('REGRESSION PTV page is a watched page', bot.isWatchedPage(PTV_URL, [PTV]) === true);
+check('REGRESSION Meteor page is a watched page', bot.isWatchedPage('https://robertsspaceindustries.com/en/pledge/Standalone-Ships/Meteor-10-Year', [METEOR]) === true);
+check('Kraken page still a watched page', bot.isWatchedPage(KRAKEN.url, [KRAKEN]) === true);
+check('First Flight Pack page is a watched page',
+  bot.isWatchedPage('https://robertsspaceindustries.com/en/pledge/Packages/Star-Citizen-First-Flight-Pack',
+    [{ name: 'First Flight Pack', url: 'https://robertsspaceindustries.com/en/pledge/Packages/Star-Citizen-First-Flight-Pack', productId: '72', maxPrice: 60, preferWarbond: false, qty: 1 }]) === true);
+check('unrelated page is NOT a watched page', bot.isWatchedPage('https://robertsspaceindustries.com/en/pledge/Standalone-Ships/Cutlass-Black', [KRAKEN]) === false);
+check('name-only match works when entry has no URL',
+  bot.isWatchedPage(PTV_URL, [{ name: 'PTV - 10 Year', productId: '72', maxPrice: 20 }]) === true);
+check('empty URL / empty watchlist -> false', bot.isWatchedPage('', [KRAKEN]) === false && bot.isWatchedPage(KRAKEN.url, []) === false);
+check('slugify: "PTV - 10 Year" -> "ptv-10-year"', bot.slugify('PTV - 10 Year') === 'ptv-10-year');
+// findBuyNowButton with Shariful's pasted Buy Now button markup.
+var pastedBtn = fakeEl({ tag: 'button', cls: 'a-button a-buyNowButton m-storeAction__buyNow -regular -transaction -filled -withShapes', testid: 'express-buy-now', arialabel: 'Buy Now', cyid: 'button' });
+check('findBuyNowButton finds the pasted Buy Now button',
+  bot.findBuyNowButton(fakeDoc({ els: [pastedBtn] })) === pastedBtn);
+check('findBuyNowButton ignores a disabled Buy Now button',
+  bot.findBuyNowButton(fakeDoc({ els: [fakeEl({ tag: 'button', cls: 'a-buyNowButton', disabled: true })] })) === null);
+check('findBuyNowButton ignores a hidden Buy Now button',
+  bot.findBuyNowButton(fakeDoc({ els: [fakeEl({ tag: 'button', cls: 'a-buyNowButton', hidden: true })] })) === null);
+check('findBuyNowButton finds a button by "Buy Now" text',
+  bot.findBuyNowButton(fakeDoc({ els: [fakeEl({ tag: 'button', text: 'Buy Now' })] })) !== null);
+check('findBuyNowButton returns null when no button exists',
+  bot.findBuyNowButton(fakeDoc({ text: 'Kraken - Drake Interplanetary' })) === null);
+check('loop calls detectBlocker(document) before the Buy Now check (no text call left)',
+  !/detectBlocker\(document\.body/.test(SRC));
+check('clickBuyNowIfAvailable gates on isWatchedPage',
+  SRC.includes('isWatchedPage(window.location.href, BOT.config.watchlist)'));
 
 console.log('\n----------------------------------------');
 console.log('PASS: ' + pass + '   FAIL: ' + fail);
