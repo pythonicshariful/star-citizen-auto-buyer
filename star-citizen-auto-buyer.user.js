@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.2
+// @version      1.3.3
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,26 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.2
+ * Star Citizen Auto Buyer — v1.3.3
  * =================================
+ * v1.3.3 FIX (2026-11-21): the express-checkout walk STILL never
+ *   clicked "Jump to bottom" — live run 17:55 Dhaka (First Flight
+ *   Pack, Auto-Pay ON) logged "Express checkout STOPPED: the page
+ *   needs card details filled in" and nothing else: no "walking
+ *   Jump to bottom → Terms → Place order…" line, no Jump click.
+ *   Root cause: the card-details guard ran at WALK START, before
+ *   step 1. In v1.3.2 that was meant to catch the form before React
+ *   rendered it — but on a fully-rendered page the empty card form
+ *   is ALREADY there, so the guard aborted the whole walk at step 0.
+ *   The guard is now REMOVED from walk start: the walk always runs
+ *   Jump → Terms first, and the guard runs ONLY immediately before
+ *   Place order (the post-jump+scroll check from v1.3.2). If no saved
+ *   payment method exists, the walk stops THERE with the clear
+ *   message (add a saved payment method / place_disabled_no_payment
+ *   backstop) and Place order is NEVER clicked. The bot still NEVER
+ *   types card details, CVV, expiry or name — that rule is absolute.
+ *   The guard-stop log now names the step it stopped at ("stopped
+ *   before Place order"). Harness 305 -> see section 19.
  * v1.3.2 FIX (2026-11-21): the express-checkout walk FAILED at step 1
  *   on a REAL checkout page (First Flight Pack, 17:38 Dhaka, logged
  *   in as QPPQMPMR9X, total $45.00): "the 'Jump to bottom' button was
@@ -1494,7 +1512,8 @@ async function waitForEnabled(el, label, timeoutMs, intervalMs) {
  * exactly as the bot did before v1.3.0.
  *
  * The bot NEVER types card details or CVV. If the page shows a payment
- * form that still needs card details, the walk stops and alarms.
+ * form that still needs card details, the walk runs Jump → Terms
+ * first and stops before Place order, alarming instead.
  */
 async function runExpressCheckoutWalk(opts) {
   opts = opts || {};
@@ -1522,16 +1541,13 @@ async function runExpressCheckoutWalk(opts) {
     return { ok: false, reason: 'blocker_' + blocker };
   }
 
-  // The bot never types card details: if the page asks for them, stop.
-  let cardField = needsPaymentDetails(document);
-  if (cardField) {
-    BOT.expressWalk = 'stopped';
-    clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
-    setStatus('CHECKOUT');
-    log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Add a saved payment method on RSI first, or finish the order yourself.');
-    notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
-    return { ok: false, reason: 'needs_payment_details' };
-  }
+  // v1.3.3: deliberately NO card-details guard here. v1.3.2 ran one
+  // at walk start, and on a fully-rendered page it saw the empty
+  // card form immediately and aborted the whole walk at step 0 —
+  // Jump was never attempted (live 2026-11-21 17:55). Jump + Terms
+  // are harmless and must run first; the guard runs ONLY
+  // immediately before Place order, and the Place-order
+  // enabled-wait below is the backstop for the no-payment case.
 
   setStatus('CHECKOUT');
   log('Express checkout (Auto-Pay ON): walking Jump to bottom → Terms → Place order…');
@@ -1576,16 +1592,19 @@ async function runExpressCheckoutWalk(opts) {
   }
   await sleep(500);
 
-  // Card-details guard again before the final click (the form can
-  // appear only once the page has scrolled to the bottom — v1.3.2:
-  // the first check ran before React rendered the form, so this
-  // second check is the one that sees the visible empty fields).
-  cardField = needsPaymentDetails(document);
+  // Card-details guard — the ONLY one, immediately before the final
+  // click (v1.3.3: the walk-start guard was removed — on a
+  // fully-rendered page it aborted the walk at step 0, before Jump
+  // was ever attempted; Jump + Terms are harmless and must run
+  // first). The form can appear only once the page has scrolled to
+  // the bottom, so this check — after jump+scroll — is the one that
+  // sees the visible empty fields. The stop log names the step.
+  const cardField = needsPaymentDetails(document);
   if (cardField) {
     BOT.expressWalk = 'stopped';
     clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
     setStatus('CHECKOUT');
-    log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Finish the order yourself.');
+    log('Express checkout STOPPED before Place order: the page needs card details filled in — the bot NEVER types card details or CVV. Add a saved payment method on RSI first, or finish the order yourself.');
     notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
     return { ok: false, reason: 'needs_payment_details' };
   }
