@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.1.1
+// @version      1.1.2
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,16 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.1.1
+ * Star Citizen Auto Buyer — v1.1.2
  * =================================
+ * v1.1.2 FIX (2026-11-21): Start Monitor -> Buy Now never fired for
+ *   "Name - 10 Year" ships (PTV - 10 Year, Meteor - 10 Year — the
+ *   in-stock test products). The old page check turned "PTV - 10 Year"
+ *   into "ptv---10-year", but the real RSI page is ".../PTV-10-Year",
+ *   so the bot never recognised the page as a watched ship page and
+ *   never clicked its Buy Now button. Page matching now slugifies the
+ *   name and the URL the same way, and also matches the watchlist
+ *   entry's own URL. Kraken (single word) worked before and still does.
  * v1.1.1 FIX (2026-11-21): CAPTCHA pause no longer fires on a normal
  *   page. The old check paused whenever the word "captcha" appeared
  *   in the page text — but every RSI page loads reCAPTCHA, so the
@@ -430,6 +438,43 @@ function isClickableEl(el) {
   return r.width > 0 && r.height > 0;
 }
 
+/**
+ * Normalise a string for URL matching: lowercase, every run of
+ * non-alphanumerics becomes a single '-'. "PTV - 10 Year" -> "ptv-10-year".
+ */
+function slugify(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/**
+ * True when the current page is one of the watched ships' pages.
+ * v1.1.1 BUG (fixed in v1.1.2): the old check slugified the ship name
+ * with name.replace(/\s+/g, '-'), which turns "PTV - 10 Year" into
+ * "ptv---10-year" — but the real RSI page is ".../PTV-10-Year", so
+ * the DOM Buy Now click never fired for any "Name - 10 Year" ship
+ * (exactly the in-stock test products). Matching now slugifies the
+ * name AND the URL the same way, and also matches the watchlist
+ * entry's own URL (its last path segment).
+ */
+function isWatchedPage(url, watchlist) {
+  const u = String(url || '').toLowerCase();
+  if (!u) return false;
+  const list = watchlist || [];
+  for (const w of list) {
+    if (w.url) {
+      try {
+        const path = new URL(String(w.url)).pathname.toLowerCase();
+        const last = path.split('/').filter(Boolean).pop() || '';
+        if (last && u.includes(last)) return true;
+        if (path && u.includes(path)) return true;
+      } catch (e) { /* bad URL in config — fall through to name match */ }
+    }
+    const name = slugify(w.name);
+    if (name && u.includes(name)) return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Browser runtime — only runs inside Tampermonkey, never in Node.     */
 /* ------------------------------------------------------------------ */
@@ -582,12 +627,7 @@ function findBuyNowButton(doc) {
 /** If a Buy Now button is available on a watched ship page, click it human-like. */
 async function clickBuyNowIfAvailable() {
   if (!BOT.config.humanClick) return false;
-  const url = window.location.href.toLowerCase();
-  const onWatchedPage = BOT.config.watchlist.some((w) => {
-    const name = String(w.name || '').toLowerCase();
-    return url.includes(name.replace(/\s+/g, '-')) || url.includes(name.replace(/\s+/g, ''));
-  });
-  if (!onWatchedPage) return false;
+  if (!isWatchedPage(window.location.href, BOT.config.watchlist)) return false;
   const btn = findBuyNowButton(document);
   if (!btn) return false;
   log('Buy Now button is available on this page — clicking it with random human-like mouse movement…');
@@ -785,7 +825,7 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-    '<b>🚀 SC Auto Buyer v1.1.1</b>' +
+    '<b>🚀 SC Auto Buyer v1.1.2</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
@@ -838,5 +878,6 @@ if (typeof module !== 'undefined' && module.exports) {
     findTargetSku, buildStockQuery, parseStockResponse, buildAddToCartMutation,
     buildNextStepMutation, nextDelayMs, detectBlocker, availabilityFromJsonLd,
     randInt, randomPointInRect, humanPath, BUY_NOW_SELECTORS, isClickableEl,
+    slugify, isWatchedPage, findBuyNowButton,
   };
 }
