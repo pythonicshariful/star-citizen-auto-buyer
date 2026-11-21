@@ -899,9 +899,8 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     bot.needsPaymentDetails(docOf([])) === null);
   // Static: gating, wiring, exports.
   check('walk is gated on Auto-Pay (OFF returns before any find/click)',
-    SRC.indexOf('async function runExpressCheckoutWalk') !== -1 &&
-    SRC.indexOf("if (!BOT.config.autoPay)") !== -1 &&
-    SRC.indexOf("if (!BOT.config.autoPay)") < SRC.indexOf('findJumpToBottomButton(document)'));
+    walkFnSrc.indexOf("if (!BOT.config.autoPay)") !== -1 &&
+    walkFnSrc.indexOf("if (!BOT.config.autoPay)") < walkFnSrc.indexOf('waitForEl('));
   check('panel label says ON places the order itself', SRC.includes('ON = the bot places the order itself'));
   check('walk checks for card details before Place order (never types them)',
     SRC.includes('needsPaymentDetails(document)') && SRC.includes('NEVER types card details'));
@@ -937,13 +936,28 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
       el.offsetParent = {};
       return el;
     }
-    // Step 1: "Jump to bottom" — exactly as Shariful pasted it.
-    const jump = scrollable(FakeEl('button', { text: 'Jump to bottom', cls: 'a-button -regular -weak -filled -withShapes -fullWidth', attrs: { 'data-cy-id': 'button' } }),
-      { left: 100, top: 2400, width: 600, height: 50, right: 700, bottom: 2450 }, 100);
-    jump.addEventListener('click', () => order.push('jump'));
-    doc.body.appendChild(jump);
-    // Step 2: Terms checkbox + label — exactly as Shariful pasted it.
+    // (v1.3.2) tIn is declared up here so the Jump listener can enable
+    // the Terms checkbox when it is clicked (the live page enables the
+    // checkbox only after scrolling to the bottom).
     let tIn = null, tLab = null;
+    // Step 1: "Jump to bottom" — exactly as Shariful pasted it.
+    // v1.3.2 options: noJump (never renders), lateJumpMs (renders late,
+    // like the live React page).
+    let jump = null;
+    if (!o.noJump) {
+      jump = scrollable(FakeEl('button', { text: 'Jump to bottom', cls: 'a-button -regular -weak -filled -withShapes -fullWidth', attrs: { 'data-cy-id': 'button' } }),
+        { left: 100, top: 2400, width: 600, height: 50, right: 700, bottom: 2450 }, 100);
+      jump.addEventListener('click', () => {
+        order.push('jump');
+        if (o.termsDisabledUntilJump && tIn) {
+          setTimeout(() => { if (tIn) tIn.disabled = false; },
+            (o.termsEnableDelayMs === undefined ? 800 : o.termsEnableDelayMs));
+        }
+      });
+      if (o.lateJumpMs) setTimeout(() => doc.body.appendChild(jump), o.lateJumpMs);
+      else doc.body.appendChild(jump);
+    }
+    // Step 2: Terms checkbox + label — exactly as Shariful pasted it.
     if (!o.noTerms) {
       tLab = scrollable(FakeEl('label', { cls: 'a-checkbox__inside', text: 'I agree to the Terms of Service and Privacy Policy' }),
         { left: 100, top: 2600, width: 600, height: 40, right: 700, bottom: 2640 }, 300);
@@ -951,6 +965,10 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
       tIn = FakeEl('input', { attrs: { 'data-testid': 'express-terms-checkbox', 'data-cy-id': 'checkbox__input' } });
       tIn.type = 'checkbox';
       tIn.checked = !!o.termsChecked;
+      // v1.3.2: the live page keeps the checkbox DISABLED until the page
+      // is scrolled to the bottom (the Jump click enables it, after a
+      // short delay, via the Jump listener above).
+      if (o.termsDisabledUntilJump) tIn.disabled = true;
       tLab.appendChild(disp);
       tLab.appendChild(tIn);
       // A real browser forwards a label click to its checkbox.
@@ -962,6 +980,9 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     const place = scrollable(FakeEl('button', { text: 'Place order', cls: 'a-button c-expressCardForm__submit -regular -transaction -filled -withShapes -fullWidth', attrs: { 'data-testid': 'express-card-form-submit', 'data-cy-id': 'button' } }),
       { left: 100, top: 2800, width: 600, height: 50, right: 700, bottom: 2850 }, 500);
     place.addEventListener('click', () => order.push('place'));
+    // v1.3.2: the live page keeps Place order DISABLED until the Terms
+    // box is checked AND a payment method is selected.
+    if (o.placeDisabled) place.disabled = true;
     doc.body.appendChild(place);
     // Optional: a visible, empty card-number field (payment form asking for details).
     if (o.cardField) {
@@ -970,6 +991,15 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
       card._rect = { left: 100, top: 200, width: 300, height: 40, right: 400, bottom: 240 };
       card.offsetParent = {};
       doc.body.appendChild(card);
+    }
+    // v1.3.2: the card form renders LATE (after the Jump click) — the
+    // first guard must miss it and the second guard must catch it.
+    if (o.lateCardMs) {
+      const card = FakeEl('input', { attrs: { autocomplete: 'cc-number', name: 'cardNumber', placeholder: 'Card number' } });
+      card.type = 'text'; card.value = '';
+      card._rect = { left: 100, top: 200, width: 300, height: 40, right: 400, bottom: 240 };
+      card.offsetParent = {};
+      setTimeout(() => doc.body.appendChild(card), o.lateCardMs);
     }
     const clickables = [jump, tLab, place].filter(Boolean);
     doc.elementFromPoint = function (x, y) {
@@ -1273,6 +1303,124 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   envN.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'X', at: Date.now() });
   envN.$('scab-stop').click();
   check('(n) Stop press clears the pending flag', envN.bot.loadCheckoutPending() === null);
+
+  console.log('== 18. Express walk waits (v1.3.2) ==');
+  // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.0, Auto-Pay ON):
+  // the walk at 17:38:40 logged "the 'Jump to bottom' button was not
+  // found" — yet a live browser inspection a minute later showed the
+  // button EXISTS and VISIBLE ("JUMP TO BOTTOM", ~680x50, enabled).
+  // The React page renders asynchronously; the walk checked ONCE, 3s
+  // after panel boot, and failed permanently. The same inspection
+  // found the Terms checkbox DISABLED until the page is scrolled to
+  // the bottom, and Place order DISABLED until Terms is checked and a
+  // payment method is selected.
+  function docWith(els) {
+    return {
+      body: { innerText: '' },
+      querySelector: function (sel) { const all = this.querySelectorAll(sel); return all.length ? all[0] : null; },
+      querySelectorAll: function (sel) {
+        return els.filter(function (el) {
+          if (sel === 'input') return el.tagName === 'INPUT';
+          if (sel === 'iframe') return el.tagName === 'IFRAME';
+          if (sel === 'button') return el.tagName === 'BUTTON';
+          var tm = sel.match(/^\[data-testid="([^"]+)"\]$/);
+          if (tm) return el.getAttribute && el.getAttribute('data-testid') === tm[1];
+          return false;
+        });
+      },
+    };
+  }
+  // --- pure: wait helpers ---
+  const jumpPure = fakeEl({ tag: 'button', text: 'Jump to bottom' });
+  check('waitForEl: immediately-present element is returned at once',
+    (await bot.waitForEl(() => jumpPure, docWith([]), 'x', 1000, 50)) === jumpPure);
+  let latePolls = 0;
+  const lateEl = await bot.waitForEl(() => (++latePolls >= 3 ? jumpPure : null), docWith([]), 'x', 2000, 50);
+  check('waitForEl: element appearing after several polls is found', lateEl === jumpPure && latePolls >= 3, 'polls=' + latePolls);
+  const t0 = Date.now();
+  const noEl = await bot.waitForEl(() => null, docWith([]), 'x', 300, 50);
+  check('waitForEl: returns null after the timeout', noEl === null && Date.now() - t0 >= 250, 'took ' + (Date.now() - t0) + 'ms');
+  check('waitForEnabled: already-enabled element returns true at once',
+    (await bot.waitForEnabled({ disabled: false }, 'x', 1000, 50)) === true);
+  const lateEn = { disabled: true };
+  setTimeout(() => { lateEn.disabled = false; }, 120);
+  check('waitForEnabled: element enabled during the wait returns true',
+    (await bot.waitForEnabled(lateEn, 'x', 2000, 50)) === true);
+  check('waitForEnabled: element staying disabled returns false after the timeout',
+    (await bot.waitForEnabled({ disabled: true }, 'x', 300, 50)) === false);
+  // --- pure: raw finders return disabled elements (the walk waits for enabled separately) ---
+  check('findJumpToBottomButtonEl returns a disabled Jump button',
+    bot.findJumpToBottomButtonEl(docOf([fakeEl({ tag: 'button', text: 'Jump to bottom', disabled: true })])) !== null);
+  check('findPlaceOrderButtonEl returns a disabled Place order button',
+    bot.findPlaceOrderButtonEl(docOf([fakeEl({ tag: 'button', text: 'Place order', testid: 'express-card-form-submit', disabled: true })])) !== null);
+  // --- pure: card guard sees hosted card fields in iframes ---
+  check('needsPaymentDetails: visible Stripe card iframe counts as card details needed',
+    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://js.stripe.com/v3/elements-inner-card-123' })])) !== null);
+  check('needsPaymentDetails: hidden card iframe does NOT count',
+    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://js.stripe.com/v3/elements-inner-card-123', hidden: true })])) === null);
+  check('needsPaymentDetails: iframe with an unrelated src does NOT count',
+    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://www.youtube.com/embed/xyz' })])) === null);
+  // --- static: the walk waits ---
+  check('walk waits for each step instead of failing on first sight',
+    walkFnSrc2.indexOf('waitForEl(') !== -1 && walkFnSrc2.indexOf('waitForEnabled(') !== -1);
+  check('walk waits for the Terms checkbox to become enabled after the jump',
+    walkFnSrc2.indexOf('terms_disabled') !== -1 && walkFnSrc2.indexOf('waitForEnabled(terms') !== -1);
+  check('walk stops with a payment-method reason when Place order never enables',
+    walkFnSrc2.indexOf('place_disabled_no_payment') !== -1 && walkFnSrc2.indexOf('saved payment method') !== -1);
+  check('script exports the wait helpers',
+    ['findJumpToBottomButtonEl', 'findPlaceOrderButtonEl', 'waitForEl', 'waitForEnabled'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
+
+  // (q) Jump renders LATE (live React page): the walk waits and the three steps run in order.
+  const envQ = makeExpressEnv({ lateJumpMs: 1200 });
+  setAutoPay(envQ, true);
+  const resQ = await envQ.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 2000 });
+  check('(q) late Jump: walk succeeds', resQ.ok === true && resQ.reason === 'placed', JSON.stringify(resQ));
+  check('(q) late Jump: the three steps ran IN ORDER (jump -> terms -> place)',
+    envQ.order.join(',') === 'jump,terms,place', envQ.order.join(','));
+  check('(q) late Jump: log says it waited for the button',
+    envQ.$('scab-log')._html.indexOf('Waiting for') !== -1);
+
+  // (r) Terms DISABLED until the Jump click: the walk waits for it to become enabled, then checks it.
+  const envR = makeExpressEnv({ termsDisabledUntilJump: true, termsEnableDelayMs: 800 });
+  setAutoPay(envR, true);
+  const resR = await envR.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 5000 });
+  check('(r) disabled-until-scrolled Terms: walk succeeds', resR.ok === true && resR.reason === 'placed', JSON.stringify(resR));
+  check('(r) disabled-until-scrolled Terms: the three steps ran IN ORDER',
+    envR.order.join(',') === 'jump,terms,place', envR.order.join(','));
+  check('(r) disabled-until-scrolled Terms: checkbox is checked afterwards', envR.termsInput.checked === true);
+  check('(r) disabled-until-scrolled Terms: log says it waited for the checkbox to become enabled',
+    envR.$('scab-log')._html.indexOf('disabled until the page is scrolled') !== -1);
+
+  // (s) Place order stays DISABLED (no payment method): the walk stops with the payment-method reason.
+  const envS = makeExpressEnv({ placeDisabled: true });
+  setAutoPay(envS, true);
+  const resS = await envS.bot.runExpressCheckoutWalk({ presenceMs: 1000, enabledMs: 800 });
+  check('(s) disabled Place order: walk fails with the payment-method reason',
+    resS.ok === false && resS.reason === 'place_disabled_no_payment', JSON.stringify(resS));
+  check('(s) disabled Place order: Jump + Terms ran, Place order was NEVER clicked',
+    envS.order.join(',') === 'jump,terms', envS.order.join(','));
+  check('(s) disabled Place order: log says a saved payment method is needed',
+    envS.$('scab-log')._html.indexOf('saved payment method') !== -1);
+
+  // (t) Card form renders LATE (after the Jump): the first guard misses it, the second guard catches it.
+  const envT = makeExpressEnv({ lateCardMs: 800 });
+  setAutoPay(envT, true);
+  const resT = await envT.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 5000 });
+  check('(t) late card form: walk stops at the second guard', resT.ok === false && resT.reason === 'needs_payment_details', JSON.stringify(resT));
+  check('(t) late card form: Jump + Terms ran, Place order was NEVER attempted',
+    envT.order.join(',') === 'jump,terms', envT.order.join(','));
+  check('(t) late card form: log says the bot NEVER types card details',
+    envT.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+
+  // (u) Jump NEVER appears: the walk fails at step 1 after waiting, with zero clicks.
+  const envU = makeExpressEnv({ noJump: true });
+  setAutoPay(envU, true);
+  const resU = await envU.bot.runExpressCheckoutWalk({ presenceMs: 600, enabledMs: 500 });
+  check('(u) missing Jump: walk fails at step 1 after waiting',
+    resU.ok === false && resU.reason === 'jump_not_found', JSON.stringify(resU));
+  check('(u) missing Jump: zero clicks', envU.order.length === 0, envU.order.join(','));
+  check('(u) missing Jump: log says the button did not appear',
+    envU.$('scab-log')._html.indexOf('did not appear') !== -1);
 
   delete global.GM_getValue;
   delete global.GM_setValue;
