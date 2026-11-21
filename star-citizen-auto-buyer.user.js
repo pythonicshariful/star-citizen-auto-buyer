@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.2.0
+// @version      1.2.1
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,32 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.2.0
+ * Star Citizen Auto Buyer — v1.2.1
  * =================================
+ * v1.2.1 (2026-11-21): the Buy Now click now scrolls FIRST and only
+ *   then clicks — and the panel can be moved and resized.
+ *   CLICK FIX: the old code scrolled the button into view with a
+ *   SMOOTH scroll and then read its position after a fixed 200-600 ms
+ *   wait. On a long product page the smooth scroll was still running
+ *   when the position was read, so the click used a STALE position
+ *   (the button had moved by the time the mouse got there) — that is
+ *   why the click "did nothing" on a real page even with the button
+ *   visible and the price under max. Now the bot scrolls with an
+ *   instant scroll, WAITS until the scroll and the layout have
+ *   settled (scroll position + button rect stable), RE-READS the
+ *   button's position, checks it is really in the viewport and not
+ *   covered by another element, and only then moves the mouse
+ *   (random curved path, random point) and clicks. If the button is
+ *   not clickable after scrolling, it logs why and does NOT click
+ *   blind at a stale coordinate.
+ *   PANEL: draggable by its header and resizable from the bottom-
+ *   right corner (same approach as the Microsoft bot v2.11: width
+ *   20-60% and height 25-90% of the window, position/size saved in
+ *   Tampermonkey storage and restored on every page; double-click
+ *   the header to reset). The panel never drags fully off-screen.
+ *   BUTTONS: every panel button was audited — Start, Stop, Test
+ *   dry-run, Add product, Remove (x) per product, Auto-Pay checkbox
+ *   — all wired and working; Stop now also clears a PAUSED state.
  * v1.2.0 (2026-11-21): ANY product can be watched now, not just ships.
  *   The panel has an "Add any product" form — paste any RSI store
  *   product URL (ship, package, vehicle…), set a max price, and the bot
@@ -44,13 +68,18 @@
  *   checkbox / image-challenge / hCaptcha / Turnstile widget that is
  *   not the corner badge) or for strong challenge wording on the page.
  *   A real CAPTCHA / queue still pauses + alarms exactly as before.
- * HOW IT CLICKS LIKE A HUMAN (v1.1.0):
+ * HOW IT CLICKS LIKE A HUMAN (v1.1.0, scroll fixed in v1.2.1):
  *   When a Buy Now / Place Order button is available, the bot does NOT
- *   call el.click() instantly. It scrolls the button into view, picks a
- *   RANDOM point inside the button, moves the mouse there along a
- *   RANDOM curved path (random steps, random 8-30 ms gaps, random hover
- *   pause 80-350 ms), then mousedown → short random hold 40-150 ms →
- *   mouseup → click. No two clicks take the same path or timing.
+ *   call el.click() instantly. It FIRST scrolls the button into the
+ *   middle of the viewport and waits until the scroll and the layout
+ *   have settled, then RE-READS the button's on-screen position and
+ *   checks it is really visible and not covered by another element.
+ *   Only then does it pick a RANDOM point inside the button, move the
+ *   mouse there along a RANDOM curved path (random steps, random
+ *   8-30 ms gaps, random hover pause 80-350 ms), then mousedown →
+ *   short random hold 40-150 ms → mouseup → click. No two clicks take
+ *   the same path or timing. If the button is not clickable after
+ *   scrolling, the bot logs why and does NOT click blind.
  *   Honest limit: Tampermonkey events are synthetic, so the browser
  *   marks them isTrusted=false — a site that checks that flag can still
  *   tell they were scripted. The random path removes the obvious
@@ -149,6 +178,7 @@ const DEFAULT_CONFIG = {
   humanClick: true,         // v1.1.0: Buy Now / Place Order via random human-like mouse path, not instant el.click()
   soundAlert: true,
   desktopAlert: true,
+  panel: null,              // v1.2.1: saved panel position/size in % of the window ({left, top, width, height}); null = default spot
 };
 
 /** "Kraken" from a pledge URL like .../pledge/ships/drake-kraken/Kraken */
@@ -696,18 +726,95 @@ async function humanMoveTo(x, y) {
   }
 }
 
+/** True when the rect is at least partly inside the viewport. `win` defaults to window; pass a fake in tests. */
+function isRectInViewport(rect, win) {
+  const w = win || (typeof window !== 'undefined' ? window : null);
+  if (!rect || !w) return false;
+  const vw = w.innerWidth || 0, vh = w.innerHeight || 0;
+  if (!vw || !vh) return false;
+  return rect.left < vw && rect.right > 0 && rect.top < vh && rect.bottom > 0;
+}
+
 /**
- * Click an element the way a human would: scroll into view, move the
- * mouse on a random curved path to a random point inside it, hover a
- * random 80-350 ms, then mousedown → random 40-150 ms hold → mouseup → click.
- * NOTE: these are synthetic events (isTrusted=false) — see header.
+ * True when the point (x, y) actually lands on `el` (or one of its
+ * children) — i.e. no sticky header / overlay / other element covers
+ * it. `doc` defaults to document; pass a fake doc in tests. When the
+ * page has no elementFromPoint (test env), returns true so the click
+ * is not blocked by a check that cannot run.
+ */
+function pointHitsElement(el, x, y, doc) {
+  const d = doc || (typeof document !== 'undefined' ? document : null);
+  if (!el || !d || typeof d.elementFromPoint !== 'function') return true;
+  let hit = null;
+  try { hit = d.elementFromPoint(x, y); } catch (e) { return false; }
+  if (!hit) return false;
+  if (hit === el) return true;
+  try { return typeof el.contains === 'function' && el.contains(hit); } catch (e) { return false; }
+}
+
+/**
+ * Scroll `el` into the middle of the viewport and wait until the scroll
+ * AND the layout have settled (scroll position + button rect stable for
+ * ~150 ms), up to `timeoutMs` (default 2000). Returns true when settled.
+ *
+ * v1.2.1 — this is the fix for "click does nothing" on a real page:
+ * the old code scrolled SMOOTH and read the position after a fixed
+ * 200-600 ms, but on a long product page the smooth scroll was still
+ * running, so the click used a stale position. An instant scroll plus
+ * a settle-wait makes the position deterministic.
+ */
+async function scrollIntoViewAndSettle(el, win, sleepFn, timeoutMs) {
+  const w = win || (typeof window !== 'undefined' ? window : null);
+  const doSleep = sleepFn || sleep;
+  if (!el || typeof el.scrollIntoView !== 'function') return false;
+  try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {
+    try { el.scrollIntoView({ block: 'center' }); } catch (e2) { /* cannot scroll */ }
+  }
+  const deadline = Date.now() + (timeoutMs === undefined ? 2000 : timeoutMs);
+  let stable = 0, lastY = null, lastTop = null, lastLeft = null;
+  while (Date.now() < deadline) {
+    let y = null, r = null;
+    try { y = w ? w.scrollY : null; } catch (e) {}
+    try { r = el.getBoundingClientRect(); } catch (e) {}
+    const top = r ? Math.round(r.top) : null;
+    const left = r ? Math.round(r.left) : null;
+    if (y === lastY && top === lastTop && left === lastLeft) {
+      stable++;
+      if (stable >= 3) return true;
+    } else {
+      stable = 0; lastY = y; lastTop = top; lastLeft = left;
+    }
+    await doSleep(50);
+  }
+  return false;
+}
+
+/**
+ * Click an element the way a human would: FIRST scroll it into view
+ * and wait for the scroll/layout to settle, THEN re-read its position
+ * and verify it is really visible and not covered, THEN move the mouse
+ * on a random curved path to a random point inside it, hover a random
+ * 80-350 ms, then mousedown → random 40-150 ms hold → mouseup → click.
+ * Returns false (without clicking blind) when the button is not
+ * clickable after scrolling. NOTE: these are synthetic events
+ * (isTrusted=false) — see header.
  */
 async function humanClick(el) {
   if (!el || !isClickableEl(el)) return false;
-  try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
-  await sleep(randInt(200, 600));
+  // 1. Scroll FIRST, wait for the scroll + layout to settle.
+  await scrollIntoViewAndSettle(el);
+  // 2. Re-read the position AFTER scrolling — never trust the pre-scroll rect.
+  if (!isClickableEl(el)) { log('Button is no longer clickable after scrolling — not clicking.'); return false; }
   const rect = el.getBoundingClientRect();
-  const target = randomPointInRect(rect);
+  if (!isRectInViewport(rect)) { log('Button is not in the viewport after scrolling — not clicking.'); return false; }
+  // 3. The random point must actually land on the button (not a sticky header / overlay).
+  let target = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const p = randomPointInRect(rect);
+    if (pointHitsElement(el, p.x, p.y)) { target = p; break; }
+  }
+  if (!target) { log('Button is covered by another element — not clicking blind.'); return false; }
+  // 4. Human-like mouse movement to the verified point, hover, hold, click.
   await humanMoveTo(target.x, target.y);
   dispatchMouse(el, 'mouseover', target.x, target.y);
   dispatchMouse(el, 'mouseenter', target.x, target.y);
@@ -871,7 +978,10 @@ function startLoop() {
 function stopLoop() {
   clearTimeout(BOT.timer);
   BOT.timer = null;
-  if (BOT.status === 'MONITORING' || BOT.status === 'IN STOCK') setStatus('IDLE');
+  // v1.2.1: Stop also clears a PAUSED state, so the button does what it
+  // says after a pause. (pauseBot calls stopLoop() first and sets PAUSED
+  // after, so this never clears a fresh pause.)
+  if (BOT.status === 'MONITORING' || BOT.status === 'IN STOCK' || BOT.status === 'PAUSED') setStatus('IDLE');
   log('Stopped.');
 }
 
@@ -1028,14 +1138,71 @@ function renderLog() {
   if (el) el.innerHTML = BOT.logLines.map((l) => '<div>' + l.replace(/</g, '&lt;') + '</div>').join('');
 }
 
+/* --- v1.2.1: draggable + resizable panel (same approach as the
+ * Microsoft bot v2.11: width 20-60% and height 25-90% of the window,
+ * position/size saved in Tampermonkey storage and restored on every
+ * page; double-click the header to reset. The panel is never dragged
+ * fully off-screen. Geometry lives in BOT.config.panel and is saved
+ * by saveConfig() with the rest of the config. --- */
+function clampPct(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function panelPct(v, total) { return Math.round(v / total * 1000) / 10; }
+
+function applyPanelGeometry() {
+  if (!isBrowser) return;
+  const panel = document.getElementById('scab-panel');
+  if (!panel) return;
+  const g = BOT.config.panel || {};
+  const w = (typeof g.width === 'number') ? clampPct(g.width, 20, 60) : null;
+  const h = (typeof g.height === 'number') ? clampPct(g.height, 25, 90) : null;
+  if (w !== null) panel.style.width = w + '%';
+  if (h !== null) { panel.style.height = h + '%'; panel.style.overflow = 'auto'; }
+  if (typeof g.left === 'number' && typeof g.top === 'number') {
+    panel.style.left = clampPct(g.left, 0, 100 - (w === null ? 27 : w)) + '%';
+    panel.style.top = clampPct(g.top, 0, 90) + '%';
+    panel.style.right = '';
+    panel.style.bottom = '';
+  }
+}
+
+function savePanelGeometry() {
+  if (!isBrowser) return;
+  const panel = document.getElementById('scab-panel');
+  if (!panel) return;
+  const r = panel.getBoundingClientRect();
+  const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+  BOT.config.panel = {
+    width: clampPct(panelPct(r.width, vw), 20, 60),
+    height: panel.style.height ? clampPct(panelPct(r.height, vh), 25, 90) : null,
+    left: panel.style.left ? clampPct(panelPct(r.left, vw), 0, 90) : null,
+    top: panel.style.top ? clampPct(panelPct(r.top, vh), 0, 90) : null,
+  };
+  saveConfig();
+}
+
+function resetPanelGeometry() {
+  const panel = document.getElementById('scab-panel');
+  if (panel) {
+    panel.style.left = '';
+    panel.style.top = '';
+    panel.style.right = '12px';
+    panel.style.bottom = '';
+    panel.style.width = '340px';
+    panel.style.height = '';
+    panel.style.overflow = '';
+  }
+  BOT.config.panel = null;
+  saveConfig();
+  log('Panel position and size reset to the default (top-right, 340px wide).');
+}
+
 function buildPanel() {
   if (document.getElementById('scab-panel')) return;
   const panel = document.createElement('div');
   panel.id = 'scab-panel';
-  panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
+  panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;max-width:calc(100vw - 24px);background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
-    '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-    '<b>🚀 SC Auto Buyer v1.2.0</b>' +
+    '<div id="scab-header" title="Drag to move the panel (double-click to reset position and size)" style="display:flex;justify-content:space-between;align-items:center;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;">' +
+    '<b>🚀 SC Auto Buyer v1.2.1</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
@@ -1055,8 +1222,9 @@ function buildPanel() {
     '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
     '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
     '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order (OFF = bot stops at payment)</label>' +
-    '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed.</div>' +
-    '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>';
+    '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
+    '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
+    '<div id="scab-resize-grip" title="Drag to resize the panel" style="position:absolute;right:2px;bottom:2px;width:18px;height:18px;cursor:nwse-resize;touch-action:none;display:flex;align-items:flex-end;justify-content:flex-end;color:#64748b;font-size:13px;line-height:1;z-index:2;">↘</div>';
   document.body.appendChild(panel);
 
   renderWatchlist();
@@ -1072,6 +1240,61 @@ function buildPanel() {
   document.getElementById('scab-start').addEventListener('click', startLoop);
   document.getElementById('scab-stop').addEventListener('click', stopLoop);
   document.getElementById('scab-test').addEventListener('click', testStockCheck);
+
+  // v1.2.1: drag the header to move, drag the corner grip to resize.
+  // Position/size save on release and restore on every page.
+  applyPanelGeometry();
+  const headerEl = document.getElementById('scab-header');
+  if (headerEl) {
+    headerEl.addEventListener('pointerdown', (e) => {
+      if (e.target && e.target.closest && e.target.closest('button')) return;
+      e.preventDefault();
+      const r = panel.getBoundingClientRect();
+      const grabX = e.clientX - r.left;
+      const grabY = e.clientY - r.top;
+      const wPct = panelPct(r.width, window.innerWidth);
+      const onMove = (ev) => {
+        const left = clampPct(panelPct(ev.clientX - grabX, window.innerWidth), 0, 100 - wPct);
+        const top = clampPct(panelPct(ev.clientY - grabY, window.innerHeight), 0, 90);
+        panel.style.left = left + '%';
+        panel.style.top = top + '%';
+        panel.style.right = '';
+        panel.style.bottom = '';
+      };
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        savePanelGeometry();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+    headerEl.addEventListener('dblclick', resetPanelGeometry);
+  }
+  const gripEl = document.getElementById('scab-resize-grip');
+  if (gripEl) {
+    gripEl.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const r0 = panel.getBoundingClientRect();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startW = panelPct(r0.width, window.innerWidth);
+      const startH = panelPct(r0.height, window.innerHeight);
+      const onMove = (ev) => {
+        panel.style.width = clampPct(startW + panelPct(ev.clientX - startX, window.innerWidth), 20, 60) + '%';
+        panel.style.height = clampPct(startH + panelPct(ev.clientY - startY, window.innerHeight), 25, 90) + '%';
+        panel.style.overflow = 'auto';
+      };
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        savePanelGeometry();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    });
+  }
 
   // If we landed on the cart after an add-to-cart, resume the checkout walk.
   if (/\/store\/pledge\/cart/.test(window.location.pathname) && BOT.found) {
@@ -1101,5 +1324,8 @@ if (typeof module !== 'undefined' && module.exports) {
     slugify, isWatchedPage, findBuyNowButton,
     entryMatchesPage, isRsiUrl, normalizeWatchEntry, isApiCheckable,
     pagePriceUsd, domBuyAllowed,
+    isRectInViewport, pointHitsElement, scrollIntoViewAndSettle, humanClick,
+    clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
+    startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
   };
 }
