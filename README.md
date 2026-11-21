@@ -79,6 +79,12 @@ Do this before any real release, so you know it works:
    **nothing is added to your cart**. That proves the stock check works.
 4. Remove the test ship, then click **▶ Start monitoring** before
    the release wave.
+5. To see the Buy Now click itself: keep the test ship in the
+   watchlist, open **that ship's own page** (for example the PTV
+   page), and click **▶ Start monitoring**. The bot should click
+   Buy Now and take you to the cart — then it stops at payment
+   (Auto-Pay is OFF), so nothing is bought. If it doesn't click,
+   check the panel log: it says what happened on each check.
 
 ## On release day
 
@@ -101,20 +107,21 @@ Do this before any real release, so you know it works:
 - Keep the poll speed as set (8–15 seconds). Faster checking looks
   more like a bot and can get the account blocked.
 
-## What is proven / not proven (v1.1.1, 2026-11-21)
+## What is proven / not proven (v1.1.2, 2026-11-21)
 
 | | Status |
 |---|---|
 | Stock check via RSI's own GraphQL API | ✅ Proven live — Kraken correctly shows "not listed" while out of stock; PTV ($15) and First Flight Pack ($60) correctly show in stock; Pioneer correctly shows out of stock |
-| Picking the Warbond version under the max price | ✅ Proven — 62/62 automated tests (`node test/test-harness.js`) |
+| Picking the Warbond version under the max price | ✅ Proven — 77/77 automated tests (`node test/test-harness.js`) |
 | CAPTCHA pause only on a real visible challenge | ✅ Fixed in v1.1.1 — a normal RSI page (reCAPTCHA badge text in the page, badge iframe in the DOM) no longer pauses the bot on Start; a genuinely visible challenge (checkbox / image challenge / hCaptcha) still pauses + alarms. Regression-tested |
+| Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 — the page check used to turn "PTV - 10 Year" into "ptv---10-year", which the real ".../PTV-10-Year" URL never contains, so the DOM Buy Now click never fired for any "Name - 10 Year" ship. Page matching now slugifies name and URL the same way. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages). **Still needs a real-browser check:** open the test ship's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
 | No page-refresh polling | ✅ Proven — the script contains no page refresh; only API calls |
-| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (62 checks) — random point, curved path, random hover/hold timings; **not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (77 checks) — random point, curved path, random hover/hold timings; **not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
 | Add-to-cart + checkout steps | ⚠️ Built from RSI's own store code, **not yet proven live** — needs a test in a real logged-in browser with a cheap in-stock item, stopping before payment |
 | Buying a Kraken in a real wave | ❌ Not proven — no wave was live during testing, and no real purchase was made |
 
 Test evidence: `test/live-test-2026-11-21.json` (live API results),
-`test/test-harness.js` (62 checks), `RESEARCH.md` (full findings).
+`test/test-harness.js` (77 checks), `RESEARCH.md` (full findings).
 
 ## Files
 
@@ -126,6 +133,8 @@ Test evidence: `test/live-test-2026-11-21.json` (live API results),
 - `test/fixtures/` — real + synthetic API responses used by the tests
 
 ## Version
+
+v1.1.2 — 2026-11-21. Fixed Start Monitor → Buy Now never firing for "Name - 10 Year" ships: the page check turned "PTV - 10 Year" into "ptv---10-year", which the real ".../PTV-10-Year" page URL never contains, so the bot never recognised the page and never clicked Buy Now (this also blocked testing with the in-stock PTV/Meteor). Page matching now slugifies the name and the URL the same way, and also matches the watchlist entry's own URL. Kraken (single word) worked before and still does. No change to the watchlist, API stock check, or Auto-Pay default OFF.
 
 v1.1.1 — 2026-11-21. Fixed false-positive CAPTCHA pause: the bot only pauses when a CAPTCHA challenge is actually visible (visible checkbox / image challenge / hCaptcha / Turnstile, not the reCAPTCHA corner badge). Before this fix, the word "captcha" in the page text ("protected by reCAPTCHA" on every RSI page) paused the bot the second Start was pressed, with no challenge on screen. A real CAPTCHA / queue still pauses + alarms. No change to the watchlist, API stock check, or Auto-Pay default OFF.
 
