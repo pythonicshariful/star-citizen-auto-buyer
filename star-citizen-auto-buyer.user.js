@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.1.0
+// @version      1.1.1
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,17 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.1.0
+ * Star Citizen Auto Buyer — v1.1.1
  * =================================
+ * v1.1.1 FIX (2026-11-21): CAPTCHA pause no longer fires on a normal
+ *   page. The old check paused whenever the word "captcha" appeared
+ *   in the page text — but every RSI page loads reCAPTCHA, so the
+ *   corner badge's "protected by reCAPTCHA" text paused the bot the
+ *   second Start was pressed, with no challenge on screen. Now the bot
+ *   pauses ONLY for a challenge that is actually visible (a visible
+ *   checkbox / image-challenge / hCaptcha / Turnstile widget that is
+ *   not the corner badge) or for strong challenge wording on the page.
+ *   A real CAPTCHA / queue still pauses + alarms exactly as before.
  * HOW IT CLICKS LIKE A HUMAN (v1.1.0):
  *   When a Buy Now / Place Order button is available, the bot does NOT
  *   call el.click() instantly. It scrolls the button into view, picks a
@@ -231,14 +240,121 @@ function nextDelayMs(cfg, consecutiveErrors, randomFn) {
   return Math.round(Math.min(backed, cfg.maxBackoffMs));
 }
 
-/** Spot a CAPTCHA / queue / verify wall in page text. Never auto-solved. */
-function detectBlocker(text) {
-  const t = String(text || '').toLowerCase();
+/**
+ * Is this element actually visible on screen? Hidden elements
+ * (display:none, zero size) are NOT visible. position:fixed elements
+ * (e.g. the reCAPTCHA corner badge) have offsetParent null too, so
+ * they are checked with computed style instead.
+ */
+function elVisible(el) {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+  var r;
+  try { r = el.getBoundingClientRect(); } catch (e) { return false; }
+  if (!r || r.width <= 0 || r.height <= 0) return false;
+  if (el.offsetParent !== null) return true;
+  // offsetParent is null: display:none OR position:fixed.
+  if (typeof getComputedStyle === 'function') {
+    try {
+      var cs = getComputedStyle(el);
+      if (!cs) return false;
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+      return cs.position === 'fixed';
+    } catch (e) { return false; }
+  }
+  return false; // no computed style available (test env): treat as hidden
+}
+
+/** Is `el` inside the small "protected by reCAPTCHA" corner badge? */
+function insideRecaptchaBadge(el) {
+  var n = el;
+  while (n) {
+    try {
+      if (typeof n.closest === 'function' && n.closest('.grecaptcha-badge')) return true;
+    } catch (e) { /* ignore */ }
+    var cls = (n.className && typeof n.className === 'string') ? n.className : '';
+    if (/\bgrecaptcha-badge\b/.test(cls)) return true;
+    n = n.parentNode || n.parentElement || null;
+  }
+  return false;
+}
+
+function iframeSrc(el) {
+  try {
+    var s = el.getAttribute ? el.getAttribute('src') : null;
+    return String(s || el.src || '');
+  } catch (e) { return ''; }
+}
+
+/**
+ * Spot a CAPTCHA / queue / verify wall — ONLY when it is actually
+ * presented to the user. Never auto-solved.
+ *
+ * v1.1.0 BUG (fixed in v1.1.1): the old check matched the bare word
+ * "captcha" anywhere in the page text. Every RSI page loads reCAPTCHA
+ * Enterprise, so the corner badge's "protected by reCAPTCHA" text is
+ * in document.body.innerText on every normal page — Start Monitor
+ * paused instantly with no challenge on screen. The bare word alone
+ * is NOT a challenge anymore:
+ *   - a challenge counts only as a VISIBLE challenge widget/iframe
+ *     (checkbox, image challenge, hCaptcha, Turnstile) that is NOT
+ *     the reCAPTCHA corner badge, or as strong challenge wording
+ *     ("verify you are human", "press & hold", ...) in the page text.
+ *   - queue / access-denied pages still count (they really block).
+ */
+function detectBlocker(doc) {
+  if (!doc) return null;
+  // Back-compat: a plain string is treated as page text only.
+  if (typeof doc === 'string') {
+    doc = { body: { innerText: doc }, querySelectorAll: function () { return []; } };
+  }
+  var body = doc.body || null;
+  var text = '';
+  try { text = String((body && body.innerText) || ''); } catch (e) { text = ''; }
+  var t = text.toLowerCase();
+
+  // 1) Visible challenge widgets / iframes (never the corner badge).
+  var selectors = [
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="hcaptcha"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="arkose"]',
+    'iframe[src*="funcaptcha"]',
+    '.g-recaptcha',
+    '.h-captcha',
+    '.cf-turnstile',
+    '[data-sitekey]',
+  ];
+  try {
+    var els = doc.querySelectorAll ? doc.querySelectorAll(selectors.join(',')) : [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!elVisible(el)) continue;
+      if (insideRecaptchaBadge(el)) continue; // the corner badge is not a challenge
+      var src = iframeSrc(el).toLowerCase();
+      if (src.indexOf('size=invisible') !== -1) continue; // invisible-mode frame
+      if (src.indexOf('recaptcha') !== -1) {
+        // Only real challenge frames count (checkbox / challenge popup),
+        // not the badge or other loader frames.
+        var isChallengeFrame = src.indexOf('anchor') !== -1 || src.indexOf('bframe') !== -1 || src.indexOf('enterprise') !== -1;
+        if (!isChallengeFrame) continue;
+      }
+      return 'captcha';
+    }
+  } catch (e) { /* ignore selector errors, fall through to text checks */ }
+
+  // 2) Strong challenge wording in the page text. The bare word
+  // "captcha" is deliberately NOT here — it appears on every RSI page
+  // (reCAPTCHA badge / footer) without any challenge being shown.
   if (!t) return null;
-  if (t.includes('captcha') || t.includes('i\'m not a robot') || t.includes('i am not a robot')) return 'captcha';
-  if (t.includes('you are in a queue') || t.includes('queue position') || t.includes('waiting room')) return 'queue';
-  if (t.includes('verify you are human') || t.includes('verify your identity') || t.includes('press & hold')) return 'verify';
-  if (t.includes('access denied') || t.includes('blocked') && t.includes('bot')) return 'blocked';
+  if (t.indexOf("i'm not a robot") !== -1 || t.indexOf('i am not a robot') !== -1 ||
+      t.indexOf('complete the captcha') !== -1 || t.indexOf('select all images') !== -1 ||
+      t.indexOf('complete the security check') !== -1 || t.indexOf('confirm you are human') !== -1 ||
+      t.indexOf('prove you are human') !== -1 || t.indexOf('are you a robot') !== -1) return 'captcha';
+  if (t.indexOf('verify you are human') !== -1 || t.indexOf('verify your identity') !== -1 ||
+      t.indexOf('press & hold') !== -1) return 'verify';
+  if (t.indexOf('you are in a queue') !== -1 || t.indexOf('queue position') !== -1 ||
+      t.indexOf('waiting room') !== -1) return 'queue';
+  if (t.indexOf('access denied') !== -1 || (t.indexOf('blocked') !== -1 && t.indexOf('bot') !== -1)) return 'blocked';
   return null;
 }
 
@@ -529,7 +645,7 @@ async function checkAllShips() {
 
 async function loopTick() {
   if (BOT.status !== 'MONITORING') return;
-  const blocker = detectBlocker(document.body ? document.body.innerText : '');
+  const blocker = detectBlocker(document);
   if (blocker) { pauseBot('RSI shows a ' + blocker + ' screen.'); return; }
   // v1.1.0: if a Buy Now button is already showing on a watched ship
   // page, click it human-like right away (API list can lag the page).
@@ -606,7 +722,7 @@ async function addToCartAndCheckout(found) {
 
 async function checkoutStepHandler() {
   if (!/\/store\/pledge\/cart/.test(window.location.pathname)) return;
-  const blocker = detectBlocker(document.body ? document.body.innerText : '');
+  const blocker = detectBlocker(document);
   if (blocker) { pauseBot('Checkout shows a ' + blocker + ' screen.'); return; }
   const payText = (document.body.innerText || '').toLowerCase();
   const onPaymentStep = /payment method|select.*payment|place order|pay now/.test(payText);
@@ -669,7 +785,7 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-    '<b>🚀 SC Auto Buyer v1.1.0</b>' +
+    '<b>🚀 SC Auto Buyer v1.1.1</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
