@@ -641,6 +641,92 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('double-click the header resets position and size',
     panel2.style.width === '340px' && panel2.style.left === '');
 
+  console.log('== 15. MouseEvent in the Tampermonkey sandbox (v1.2.2) ==');
+  // REGRESSION (live 2026-11-21, First Flight Pack page, max $100, price $60):
+  // the button was found and the price guard passed, but the click never
+  // happened — "Failed to construct 'MouseEvent': Failed to read the 'view'
+  // property from 'UIEventInit': Failed to convert value to 'Window'."
+  // Cause: dispatchMouse passed `view: window`, and inside Tampermonkey the
+  // script's `window` is a sandbox proxy, NOT the page's real Window, so the
+  // page's MouseEvent constructor rejects it. `view` is optional, so the
+  // fix is to not pass it at all.
+  // The strict constructor below mimics the browser: it only accepts the
+  // PAGE window as `view`; any other object throws exactly like the browser.
+  const pageWin = {};
+  function StrictMouseEvent(type, init) {
+    if (init && Object.prototype.hasOwnProperty.call(init, 'view') && init.view !== pageWin) {
+      throw new TypeError("Failed to construct 'MouseEvent': Failed to read the 'view' property from 'UIEventInit': Failed to convert value to 'Window'.");
+    }
+    this.type = type;
+    if (init) { for (const k in init) this[k] = init[k]; }
+  }
+  // The OLD shape throws exactly the live error…
+  check('REGRESSION old shape { view: sandboxWindow } is rejected by the page MouseEvent constructor',
+    (() => { try { new StrictMouseEvent('click', { view: { sandboxed: true }, clientX: 1, clientY: 2 }); return false; } catch (e) { return e instanceof TypeError && e.message.indexOf("Failed to convert value to 'Window'") !== -1; } })());
+  // …while an init without `view` builds fine.
+  check('init without view builds fine',
+    (() => { try { const ev = new StrictMouseEvent('click', { bubbles: true, clientX: 10, clientY: 20 }); return ev.type === 'click' && ev.clientX === 10 && !('view' in ev); } catch (e) { return false; } })());
+  // The source must not pass a `view` to the event constructor anymore.
+  const dmSrc = (SRC.match(/function dispatchMouse[\s\S]*?\n}/) || [''])[0];
+  const mmSrc = (SRC.match(/function makeMouseEvent[\s\S]*?\n}/) || [''])[0];
+  check('dispatchMouse passes no view to the event constructor', dmSrc.length > 0 && dmSrc.indexOf('view:') === -1);
+  check('makeMouseEvent builds events without a view property', mmSrc.length > 0 && mmSrc.indexOf('view:') === -1 && mmSrc.indexOf('new MouseEvent') !== -1);
+  check('makeMouseEvent is exported for tests', typeof bot.makeMouseEvent === 'function');
+  // Behavioral: the bot's click path inside a Tampermonkey-like sandbox —
+  // the script's `window` is a sandbox proxy, NOT the page's real Window.
+  global.MouseEvent = StrictMouseEvent;
+  const sandboxWin = makeFakeWindow();
+  sandboxWin.location.href = FFP_URL;
+  sandboxWin.location.pathname = '/en/pledge/Packages/Star-Citizen-First-Flight-Pack';
+  const sandboxDoc = makeFakeDocument();
+  const loader3 = new Function('module', 'exports', 'window', 'document', SRC);
+  const moduleObj3 = { exports: {} };
+  loader3(moduleObj3, moduleObj3.exports, sandboxWin, sandboxDoc);
+  const bot3 = moduleObj3.exports;
+  const $3 = (id) => sandboxDoc.getElementById(id);
+  // The exact live scenario: First Flight Pack button, below the fold.
+  let sbBtn = null;
+  const sbCover = FakeEl('div');
+  sandboxDoc.elementFromPoint = function (x, y) {
+    if (!sbBtn) return null;
+    const r = sbBtn._rect;
+    return (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) ? sbBtn : sbCover;
+  };
+  function makeSandboxButton() {
+    const btn = FakeEl('button');
+    btn.setAttribute('data-testid', 'express-buy-now');
+    btn.offsetParent = {};
+    btn._rect = { left: 100, top: 1500, width: 200, height: 50, right: 300, bottom: 1550 };
+    btn.scrollCalls = [];
+    btn.scrollIntoView = function (opts) {
+      this.scrollCalls.push(opts);
+      sandboxWin.scrollY = 1200;
+      this._rect = { left: 100, top: 300, width: 200, height: 50, right: 300, bottom: 350 };
+    };
+    btn.getBoundingClientRect = function () { return this._rect; };
+    return btn;
+  }
+  sbBtn = makeSandboxButton();
+  const okSandbox = await bot3.humanClick(sbBtn);
+  check('REGRESSION humanClick works when window is a sandbox proxy (no real Window view)', okSandbox === true);
+  const sbClickEv = sbBtn._events.find((e) => e.type === 'click');
+  check('click event reached the button in the sandbox',
+    !!sbClickEv && sbClickEv.clientY >= 300 && sbClickEv.clientY <= 350);
+  check('dispatched events carry no view property', !!sbClickEv && !('view' in sbClickEv));
+  check('makeMouseEvent (first loader) builds events under the strict constructor',
+    (() => { try { const ev = bot.makeMouseEvent('mousedown', { bubbles: true, clientX: 5, clientY: 6 }); return ev.type === 'mousedown' && ev.clientX === 5 && !('view' in ev); } catch (e) { return false; } })());
+  // Failure path: if event construction throws anyway, the click fails
+  // LOUDLY (log says FAILED + retry) instead of hiding as "continuing".
+  global.MouseEvent = function () { throw new Error('boom: no MouseEvent'); };
+  const failBtn = makeSandboxButton();
+  sbBtn = failBtn;
+  const okFail = await bot3.humanClick(failBtn);
+  check('click construction failure returns false, does not throw out of humanClick', okFail === false);
+  check('click failure is logged plainly as FAILED with a retry note',
+    !!$3('scab-log') && $3('scab-log')._html.indexOf('Buy Now click FAILED') !== -1 &&
+    $3('scab-log')._html.indexOf('will retry on the next tick') !== -1);
+  global.MouseEvent = StrictMouseEvent;
+
   delete global.MouseEvent;
 })().then(() => {
   console.log('\n----------------------------------------');
