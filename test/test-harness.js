@@ -251,8 +251,80 @@ check('findBuyNowButton returns null when no button exists',
   bot.findBuyNowButton(fakeDoc({ text: 'Kraken - Drake Interplanetary' })) === null);
 check('loop calls detectBlocker(document) before the Buy Now check (no text call left)',
   !/detectBlocker\(document\.body/.test(SRC));
-check('clickBuyNowIfAvailable gates on isWatchedPage',
-  SRC.includes('isWatchedPage(window.location.href, BOT.config.watchlist)'));
+check('isWatchedPage still exported as a helper (v1.2.0 uses entryMatchesPage per entry)',
+  typeof bot.isWatchedPage === 'function' && typeof bot.entryMatchesPage === 'function');
+
+console.log('== 11. Any product watchlist (v1.2.0) ==');
+var FFP_URL = 'https://robertsspaceindustries.com/en/pledge/Packages/Star-Citizen-First-Flight-Pack';
+var FFP = { name: 'First Flight Pack', url: FFP_URL, productId: null, maxPrice: 60, preferWarbond: false, qty: 1 };
+
+// (a) Adding a package product makes the DOM Buy Now path fire on its page.
+check('(a) First Flight Pack page matches its own watchlist entry', bot.entryMatchesPage(FFP, FFP_URL) === true);
+check('(a) isWatchedPage true for FFP when FFP is watchlisted', bot.isWatchedPage(FFP_URL, [KRAKEN, FFP]) === true);
+check('(a) findBuyNowButton finds the button on the FFP page',
+  bot.findBuyNowButton(fakeDoc({ els: [pastedBtn] })) === pastedBtn);
+// (b) A product NOT in the watchlist still does NOT click.
+check('(b) FFP page is NOT watched when only Kraken is watchlisted', bot.isWatchedPage(FFP_URL, [KRAKEN]) === false);
+check('(b) Cutlass page is NOT watched when only FFP is watchlisted',
+  bot.isWatchedPage('https://robertsspaceindustries.com/en/pledge/Standalone-Ships/Cutlass-Black', [FFP]) === false);
+// (c) Kraken behavior unchanged.
+check('(c) Kraken still the only default watchlist entry', bot.DEFAULT_CONFIG.watchlist.length === 1 && bot.DEFAULT_CONFIG.watchlist[0].name === 'Kraken');
+check('(c) Kraken entry is API-checkable (list 72)', bot.isApiCheckable(KRAKEN) === true);
+check('(c) Kraken page still matches', bot.isWatchedPage(KRAKEN.url, [KRAKEN]) === true);
+
+// normalizeWatchEntry — the panel form.
+var normFFP = bot.normalizeWatchEntry({ url: FFP_URL, name: '', maxPrice: '60', productId: '', preferWarbond: false });
+check('normalize: URL-only FFP -> name derived from URL, page-only, qty 1',
+  !normFFP.error && normFFP.entry.name === 'Star Citizen First Flight Pack' && normFFP.entry.productId === null && normFFP.entry.maxPrice === 60 && normFFP.entry.qty === 1, JSON.stringify(normFFP));
+var normKraken = bot.normalizeWatchEntry({ url: KRAKEN.url, name: 'Kraken', maxPrice: 1400, productId: '72', preferWarbond: true });
+check('normalize: full Kraken entry passes through with list 72 + warbond',
+  !normKraken.error && normKraken.entry.productId === '72' && normKraken.entry.preferWarbond === true, JSON.stringify(normKraken));
+check('normalize: non-RSI URL rejected', !!bot.normalizeWatchEntry({ url: 'https://example.com/product', maxPrice: 10 }).error);
+check('normalize: missing URL rejected', !!bot.normalizeWatchEntry({ url: '', maxPrice: 10 }).error);
+check('normalize: missing max price rejected', !!bot.normalizeWatchEntry({ url: FFP_URL }).error);
+check('normalize: max price 0 rejected', !!bot.normalizeWatchEntry({ url: FFP_URL, maxPrice: 0 }).error);
+check('normalize: non-digit list ID rejected', !!bot.normalizeWatchEntry({ url: FFP_URL, maxPrice: 60, productId: 'abc' }).error);
+check('normalize: explicit name wins over URL-derived name',
+  bot.normalizeWatchEntry({ url: FFP_URL, name: 'My Pack', maxPrice: 60 }).entry.name === 'My Pack');
+check('isRsiUrl accepts pledge URLs, rejects other sites',
+  bot.isRsiUrl(FFP_URL) === true && bot.isRsiUrl(KRAKEN.url) === true && bot.isRsiUrl('https://example.com/en/pledge/x') === false && bot.isRsiUrl('not a url') === false);
+check('isApiCheckable: FFP without list ID is page-only', bot.isApiCheckable(FFP) === false);
+check('isApiCheckable: entry with list 72 is API-checkable', bot.isApiCheckable({ productId: '72' }) === true);
+check('isApiCheckable: missing/blank list ID is page-only', bot.isApiCheckable({}) === false && bot.isApiCheckable({ productId: '' }) === false && bot.isApiCheckable({ productId: '  ' }) === false);
+
+// findTargetSku works for a package, not just ships.
+var ffpSkus = [{ id: '50001', title: 'Star Citizen - First Flight Pack', isWarbond: false, stock: { available: true }, price: { amount: 6000 } }];
+check('findTargetSku: First Flight Pack $60 in stock under $60 cap',
+  (() => { const r = bot.findTargetSku(ffpSkus, FFP); return r.sku !== null && r.reason === 'in_stock' && r.sku.id === '50001'; })());
+check('findTargetSku: First Flight Pack $60 over a $50 cap -> over_max_price',
+  bot.findTargetSku(ffpSkus, { name: 'First Flight Pack', maxPrice: 50 }).reason === 'over_max_price');
+
+// DOM price guard (pagePriceUsd + domBuyAllowed).
+function jsonLdDoc(price) {
+  var scripts = [];
+  if (price !== null && price !== undefined) scripts = [{ textContent: JSON.stringify({ offers: { price: price, availability: 'https://schema.org/InStock' } }) }];
+  return { querySelectorAll: function (sel) { return sel === 'script[type="application/ld+json"]' ? scripts : []; } };
+}
+check('pagePriceUsd reads $60.00 from JSON-LD', bot.pagePriceUsd(jsonLdDoc('60.00')) === 60);
+check('pagePriceUsd reads numeric 75 from JSON-LD', bot.pagePriceUsd(jsonLdDoc(75)) === 75);
+check('pagePriceUsd returns null with no JSON-LD', bot.pagePriceUsd(jsonLdDoc(null)) === null);
+check('pagePriceUsd returns null on malformed JSON-LD',
+  bot.pagePriceUsd({ querySelectorAll: function () { return [{ textContent: '{not json' }]; } }) === null);
+check('domBuyAllowed: page $60 at max $60 -> allowed', bot.domBuyAllowed(FFP, 60).allowed === true);
+check('domBuyAllowed: page $70 above max $60 -> NOT allowed', bot.domBuyAllowed(FFP, 70).allowed === false && bot.domBuyAllowed(FFP, 70).reason === 'over_max_price');
+check('domBuyAllowed: unknown page price -> allowed (API is the strict cap)', bot.domBuyAllowed(FFP, null).allowed === true);
+
+// Panel + wiring (static).
+check('panel has an "Add any product" form', SRC.includes('scab-add-url') && SRC.includes('scab-add-name') && SRC.includes('scab-add-price') && SRC.includes('scab-add-list') && SRC.includes('scab-add-btn'));
+check('panel rows have a Remove button', SRC.includes('data-scab-remove'));
+check('panel explains page-only entries', SRC.includes('page only'));
+check('panel version label is v1.2.0', SRC.includes('SC Auto Buyer v1.2.0'));
+check('clickBuyNowIfAvailable gates on entryMatchesPage (any watchlisted product)',
+  SRC.includes('entryMatchesPage(w, window.location.href)'));
+check('clickBuyNowIfAvailable enforces the max price from the page', SRC.includes('domBuyAllowed(entry, price)'));
+check('API check skipped for page-only entries', SRC.includes("reason: 'page_only'"));
+check('script exports the new pure functions',
+  ['normalizeWatchEntry', 'isApiCheckable', 'entryMatchesPage', 'pagePriceUsd', 'domBuyAllowed', 'isRsiUrl'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
 
 console.log('\n----------------------------------------');
 console.log('PASS: ' + pass + '   FAIL: ' + fail);
