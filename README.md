@@ -124,24 +124,26 @@ Do this before any real release, so you know it works:
 - Keep the poll speed as set (8–15 seconds). Faster checking looks
   more like a bot and can get the account blocked.
 
-## What is proven / not proven (v1.2.0, 2026-11-21)
+## What is proven / not proven (v1.2.1, 2026-11-21)
 
 | | Status |
 |---|---|
 | Stock check via RSI's own GraphQL API | ✅ Proven live — Kraken correctly shows "not listed" while out of stock; PTV ($15) and First Flight Pack ($60) correctly show in stock; Pioneer correctly shows out of stock |
-| Picking the Warbond version under the max price | ✅ Proven — 114/114 automated tests (`node test/test-harness.js`) |
+| Picking the Warbond version under the max price | ✅ Proven — 169/169 automated tests (`node test/test-harness.js`) |
 | Add any product from the panel (ship / package / vehicle) | ✅ Proven in harness — URL + max price validated, name read from the URL, list ID optional; a product NOT in the watchlist never clicks. **Not live-proven in a real browser yet** |
 | Page-only products (no list ID) | ✅ Proven in harness — API check skipped, DOM Buy Now path watches the product's own page; the page must stay open. **Not live-proven in a real browser yet** |
 | Max price respected on the Buy Now click too | ✅ Proven in harness — page price above the cap does NOT click |
 | CAPTCHA pause only on a real visible challenge | ✅ Fixed in v1.1.1 — a normal RSI page (reCAPTCHA badge text in the page, badge iframe in the DOM) no longer pauses the bot on Start; a genuinely visible challenge (checkbox / image challenge / hCaptcha) still pauses + alarms. Regression-tested |
-| Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 — the page check used to turn "PTV - 10 Year" into "ptv---10-year", which the real ".../PTV-10-Year" URL never contains, so the DOM Buy Now click never fired for any "Name - 10 Year" ship. Page matching now slugifies name and URL the same way. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages). **Still needs a real-browser check:** open the test ship's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
+| Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 (page matching) and v1.2.1 (scroll-then-click, below) — the DOM Buy Now click never fired for any "Name - 10 Year" ship, and the click used a stale position while the smooth scroll was still running. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages). **Still needs a real-browser check:** open the test ship's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
 | No page-refresh polling | ✅ Proven — the script contains no page refresh; only API calls |
-| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (114 checks) — random point, curved path, random hover/hold timings; **not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (169 checks) — the bot scrolls the button into view FIRST, waits for the scroll/layout to settle, re-reads the position, checks the button is really visible and not covered, then random point, curved path, random hover/hold timings; a covered / off-screen / disabled button is NOT clicked. **Not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Panel draggable + resizable | ✅ Proven in harness — drag the header to move, drag the bottom-right corner to resize (width 20–60%, height 25–90% of the window, same as the Microsoft bot); position/size save in Tampermonkey storage and restore on every page; double-click the header to reset. **Not live-proven in a real browser yet** |
+| Every panel button works | ✅ Proven in harness (fake-browser test) — Start starts monitoring, Stop stops it (and clears a PAUSED state), Test runs a dry-run check, Add product adds + rejects duplicates, Remove (✕) removes that product, Auto-Pay checkbox flips the setting. **Not live-proven in a real browser yet** |
 | Add-to-cart + checkout steps | ⚠️ Built from RSI's own store code, **not yet proven live** — needs a test in a real logged-in browser with a cheap in-stock item, stopping before payment |
 | Buying a Kraken in a real wave | ❌ Not proven — no wave was live during testing, and no real purchase was made |
 
 Test evidence: `test/live-test-2026-11-21.json` (live API results),
-`test/test-harness.js` (114 checks), `RESEARCH.md` (full findings).
+`test/test-harness.js` (169 checks), `RESEARCH.md` (full findings).
 
 ## Files
 
@@ -153,6 +155,8 @@ Test evidence: `test/live-test-2026-11-21.json` (live API results),
 - `test/fixtures/` — real + synthetic API responses used by the tests
 
 ## Version
+
+v1.2.1 — 2026-11-21. The Buy Now click now scrolls FIRST and only then clicks: the old code scrolled smooth and read the button position after a fixed 200–600 ms, but on a long product page the smooth scroll was still running, so the click used a stale position and "did nothing" on a real page. Now the bot scrolls instantly, waits for the scroll + layout to settle, re-reads the position, checks the button is really visible and not covered, and only then moves the mouse (random curved path, random point) and clicks — a covered / off-screen / disabled button is never clicked blind. The panel is now draggable by its header and resizable from the bottom-right corner (same as the Microsoft bot: width 20–60%, height 25–90% of the window, position/size saved and restored; double-click the header to reset). Every panel button was audited and behaviorally tested — Start, Stop (now also clears a PAUSED state), Test dry-run, Add product, Remove (✕) per product, Auto-Pay checkbox — all work. Harness 169/169. No change to the any-product watchlist, API-only stock checks, max-price guard, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
 v1.2.0 — 2026-11-21. Any product can be watched now, not just ships: the panel has an "Add any product" form (paste any RSI store product URL, set a max price — no code editing), with a Remove button per product. Entries carry an optional store-list ID (ships: 72 = Standalone Ships): with one, the bot also checks the product by API from any page; without one, the product is "page only" — the bot watches its Buy Now button, so its page must stay open in a tab. The DOM Buy Now path now also respects the max price (page price above the cap does not click), and a product NOT in the watchlist never clicks. Kraken is still the default entry; harness 114/114. No change to API-only stock checks, human-like click, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
