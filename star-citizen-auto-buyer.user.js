@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.3
+// @version      1.3.4
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -9,14 +9,57 @@
 // @grant        GM_setValue
 // @grant        GM_notification
 // @grant        GM_openInTab
+// @grant        GM_info
 // @connect      robertsspaceindustries.com
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.3
+ * Star Citizen Auto Buyer — v1.3.4
  * =================================
+ * v1.3.4 FIX (2026-11-21): two things Shariful asked for.
+ *   (1) The card-details guard is REMOVED ENTIRELY. The 18:04 live
+ *   run still showed the "Express checkout needs card details"
+ *   popup: v1.3.3 had removed the walk-start guard, but the second
+ *   guard — immediately before Place order — still fired on the
+ *   test account (no saved payment method) and stopped the walk.
+ *   Shariful: "ri restriction ta uthaiya daw". The guard is gone:
+ *   the walk runs Jump → Terms → waits for Place order to become
+ *   enabled (~15s). If a saved payment method is present (the
+ *   buyer's account WILL have his card saved), Place order enables
+ *   and the bot CLICKS it — that is the whole point. If no payment
+ *   method is saved, Place order stays disabled and the walk stops
+ *   at step 3 with place_disabled_no_payment and a clear "add a
+ *   saved payment method" message — panel log + sound alarm, NO
+ *   blocking popup. Removing the guard does NOT complete an order
+ *   without a payment method; the fix for that is a saved payment
+ *   method on RSI (or card details typed by hand). The bot still
+ *   NEVER types card details, CVV, expiry or name — that rule is
+ *   absolute and unchanged; only the early stop goes away. The
+ *   Place-order enabled-wait is now the SOLE backstop.
+ *   (2) The bot STALLED on the checkout page after Buy Now and had
+ *   to be started again by hand (Shariful, 18:04). Root cause in
+ *   the cart-page handler: it detected the "payment step" with a
+ *   body-text regex (/payment method|select.*payment|place order|
+ *   pay now/) — the cart summary itself contains "payment method"
+ *   text, so the handler thought the page was already on the
+ *   payment step, found no enabled Place Order button, logged "pay
+ *   yourself" and CLEARED the pending flag: dead end. And when the
+ *   moveNext step mutation failed once, the handler logged and
+ *   never re-scheduled: dead end. Now the handler detects the
+ *   payment step by a REAL Place Order / Pay Now button in the DOM
+ *   (never by body text); with no such button it advances with
+ *   moveNext and RETRIES a failed step (bounded, ~6 attempts),
+ *   keeping the pending flag so a page reload resumes the checkout
+ *   hands-off. Buy Now click → navigation → the walk auto-starts on
+ *   the checkout page (cart and/or express-checkout) with NO manual
+ *   Start press. Harness 317 -> see section 20.
+ *   (3) The panel header hardcoded "v1.3.0" — the version never
+ *   showed. The header now shows the real version
+ *   ("SC Auto Buyer v1.3.4"), read from GM_info.script.version
+ *   with a hardcoded SCAB_VERSION fallback kept in sync with the
+ *   @version metadata.
  * v1.3.3 FIX (2026-11-21): the express-checkout walk STILL never
  *   clicked "Jump to bottom" — live run 17:55 Dhaka (First Flight
  *   Pack, Auto-Pay ON) logged "Express checkout STOPPED: the page
@@ -116,7 +159,10 @@
  *   Auto-Pay is OFF the bot clicks NONE of the three — it stops at
  *   the checkout page with an alarm, exactly as before. The bot NEVER
  *   types card details or CVV: if the page shows a payment form that
- *   needs card details, the walk stops and alarms instead.
+ *   needs card details, the walk stops and alarms instead. (v1.3.4:
+ *   the card-details guard is REMOVED entirely at Shariful's request
+ *   — the walk now only stops at step 3 when Place order never
+ *   becomes enabled, i.e. no saved payment method is selected.)
  * v1.2.2 FIX (2026-11-21): the Buy Now click itself threw on the real
  *   RSI page, so the button was found, the price guard passed — and
  *   still nothing was clicked. The live error was:
@@ -263,6 +309,22 @@
  */
 
 'use strict';
+
+/* v1.3.4: the version the panel shows. Read from the installed
+ * userscript's own metadata (GM_info.script.version) when available,
+ * with this constant as the fallback — keep it in sync with the
+ * @version metadata above, so the panel always shows the version
+ * that is actually installed. (v1.3.0–v1.3.3 the header hardcoded
+ * "v1.3.0", so the panel never showed the real version.) */
+const SCAB_VERSION = '1.3.4';
+function scabVersion() {
+  try {
+    if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+      return String(GM_info.script.version);
+    }
+  } catch (e) {}
+  return SCAB_VERSION;
+}
 
 /* ------------------------------------------------------------------ */
 /* Pure logic — no DOM, no Tampermonkey APIs. Unit-tested in Node.    */
@@ -751,6 +813,7 @@ const BOT = {
   found: null, // { ship, sku } once stock is found
   mouse: null, // last known mouse position {x, y} for human-like paths
   expressWalk: 'idle', // v1.3.0: idle | running | done | stopped (express-checkout walk state, one run per page load)
+  checkoutRetries: 0, // v1.3.4: failed cart checkout-step attempts in a row (bounded retries, see checkoutStepHandler)
 };
 
 function log(msg) {
@@ -792,6 +855,7 @@ function loadConfig() {
  * fallback is used instead. */
 const CHECKOUT_PENDING_KEY = 'scab_checkout_pending';
 const CHECKOUT_PENDING_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+const CHECKOUT_STEP_MAX_RETRIES = 6; // v1.3.4: failed cart checkout-step attempts before the handler stops (flag kept, reload resumes)
 var checkoutPendingMemory = null;
 function saveCheckoutPending(pending) {
   try {
@@ -1131,6 +1195,33 @@ function findPlaceOrderButton(doc) {
 }
 
 /**
+ * Find a "Place order" / "Pay now" button on a CART checkout page,
+ * regardless of whether it is clickable yet — the cart handler waits
+ * for it to become enabled separately. Matched by button TEXT.
+ * "Confirm" alone is deliberately NOT matched: cookie banners and
+ * address forms have "Confirm" buttons, and clicking one of those
+ * is not placing an order ("Confirm order" IS matched — that is a
+ * real order button). v1.3.4: the old handler detected the payment
+ * step with a body-text regex instead, and the cart summary's own
+ * "payment method" text made it misfire on the plain cart page.
+ */
+function findPlaceOrderLikeButtonEl(doc) {
+  const d = doc || document;
+  const btns = d.querySelectorAll ? d.querySelectorAll('button') : [];
+  for (const b of btns) {
+    const t = (b.textContent || '').trim().toLowerCase();
+    if (/place order|pay now|confirm order/.test(t)) return b;
+  }
+  return null;
+}
+
+/** A "Place order" / "Pay now" button, only when visible and clickable. */
+function findPlaceOrderLikeButton(doc) {
+  const el = findPlaceOrderLikeButtonEl(doc);
+  return el && isClickableEl(el) ? el : null;
+}
+
+/**
  * What to click to check the Terms box: the <label> wrapping the
  * checkbox if there is one (clicking a label fires the React handler
  * on the input), else the checkbox's display wrapper, else the input
@@ -1156,57 +1247,13 @@ function termsClickTarget(input) {
   return input;
 }
 
-/**
- * Does this checkout page show a payment form that still needs card
- * details typed in? Returns the first visible, EMPTY card field found
- * (card number / CVV / CVC / expiry), or null. A field that already
- * has a value (a saved card) does NOT count. The bot NEVER types card
- * details — when this returns a field, the checkout walk stops.
- */
-function needsPaymentDetails(doc) {
-  const d = doc || document;
-  if (!d.querySelectorAll) return null;
-  let inputs = [];
-  try { inputs = d.querySelectorAll('input'); } catch (e) { return null; }
-  for (const el of inputs) {
-    if (!el) continue;
-    const type = String((el.type || '')).toLowerCase();
-    if (type === 'hidden' || type === 'checkbox' || type === 'radio' || type === 'submit' || type === 'button') continue;
-    if (!isClickableEl(el)) continue; // hidden / 0-size fields are not a form asking for input
-    const val = String(el.value === undefined || el.value === null ? '' : el.value).trim();
-    if (val !== '') continue; // already filled (e.g. a saved card) — not asking for details
-    let ac = '';
-    try { ac = String(el.getAttribute ? el.getAttribute('autocomplete') || '' : '').toLowerCase(); } catch (e) {}
-    if (ac === 'cc-number' || ac === 'cc-csc' || ac === 'cc-exp' || ac === 'cc-exp-month' || ac === 'cc-exp-year') return el;
-    let hay = '';
-    try {
-      hay = [el.getAttribute ? el.getAttribute('name') : '', el.getAttribute ? el.getAttribute('id') : '', el.getAttribute ? el.getAttribute('placeholder') : ''].join(' ').toLowerCase();
-    } catch (e) { hay = ''; }
-    if (/card.?number|cvv|cvc|expir|card.?holder|card.?name/.test(hay)) return el;
-  }
-  // v1.3.2: hosted card fields. A payment provider's card form often
-  // lives inside a cross-origin iframe (e.g. Stripe Elements) that
-  // the bot cannot read into — querySelectorAll('input') never sees
-  // those fields, and the iframe's own document is off-limits. A
-  // VISIBLE iframe whose src/name/title/id says card/payment is
-  // itself the signal that card details are being asked for, so it
-  // counts the same as a visible empty card field. Honest limit: an
-  // iframe with no tell-tale src/name cannot be recognised this way —
-  // the Place-order-disabled wait is then the backstop.
-  let frames = [];
-  try { frames = d.querySelectorAll('iframe'); } catch (e) { frames = []; }
-  for (const fr of frames) {
-    if (!fr || typeof fr.getBoundingClientRect !== 'function') continue;
-    const r = fr.getBoundingClientRect();
-    if (!r || r.width <= 0 || r.height <= 0) continue; // hidden iframe — not a form asking for input
-    let hay = '';
-    try {
-      hay = [fr.getAttribute ? fr.getAttribute('src') : '', fr.getAttribute ? fr.getAttribute('name') : '', fr.getAttribute ? fr.getAttribute('title') : '', fr.getAttribute ? fr.getAttribute('id') : ''].join(' ').toLowerCase();
-    } catch (e) { hay = ''; }
-    if (/card|stripe|cvv|cvc|secure|payment/.test(hay)) return fr;
-  }
-  return null;
-}
+/* v1.3.4: needsPaymentDetails() (the card-details guard) is REMOVED
+ * entirely at Shariful's request — the walk no longer stops early on
+ * an empty card form. The Place-order enabled-wait in the walk is
+ * now the sole backstop: with a saved payment method Place order
+ * enables and is clicked; without one it stays disabled and the
+ * walk stops at step 3 with a clear "add a saved payment method"
+ * message. The bot still NEVER types card details.
 
 /* --- v1.3.1: did the Buy Now click actually do anything? ---
  * "Buy Now clicked" used to mean only that the synthetic events
@@ -1511,9 +1558,12 @@ async function waitForEnabled(el, label, timeoutMs, intervalMs) {
  * clicks NOTHING — it stops at the checkout page with an alarm,
  * exactly as the bot did before v1.3.0.
  *
- * The bot NEVER types card details or CVV. If the page shows a payment
- * form that still needs card details, the walk runs Jump → Terms
- * first and stops before Place order, alarming instead.
+ * The bot NEVER types card details or CVV. (v1.3.4: the
+ * card-details guard is REMOVED entirely — the walk no longer stops
+ * early on an empty card form. With a saved payment method Place
+ * order enables and is clicked; without one it stays disabled and
+ * the walk stops at step 3 with a clear "add a saved payment
+ * method" message.)
  */
 async function runExpressCheckoutWalk(opts) {
   opts = opts || {};
@@ -1541,13 +1591,15 @@ async function runExpressCheckoutWalk(opts) {
     return { ok: false, reason: 'blocker_' + blocker };
   }
 
-  // v1.3.3: deliberately NO card-details guard here. v1.3.2 ran one
-  // at walk start, and on a fully-rendered page it saw the empty
-  // card form immediately and aborted the whole walk at step 0 —
-  // Jump was never attempted (live 2026-11-21 17:55). Jump + Terms
-  // are harmless and must run first; the guard runs ONLY
-  // immediately before Place order, and the Place-order
-  // enabled-wait below is the backstop for the no-payment case.
+  // v1.3.4: NO card-details guard anywhere in this walk anymore.
+  // v1.3.2 ran one at walk start (aborted the whole walk at step 0
+  // on a fully-rendered page, live 2026-11-21 17:55); v1.3.3 kept
+  // one immediately before Place order (still stopped the walk on
+  // the test account, live 2026-11-21 18:04). Both are removed at
+  // Shariful's request — the buyer WILL have a card saved, so the
+  // walk must not stop on an empty card form. Jump + Terms run
+  // first; the Place-order enabled-wait below is now the SOLE
+  // backstop for the no-payment case.
 
   setStatus('CHECKOUT');
   log('Express checkout (Auto-Pay ON): walking Jump to bottom → Terms → Place order…');
@@ -1592,22 +1644,16 @@ async function runExpressCheckoutWalk(opts) {
   }
   await sleep(500);
 
-  // Card-details guard — the ONLY one, immediately before the final
-  // click (v1.3.3: the walk-start guard was removed — on a
-  // fully-rendered page it aborted the walk at step 0, before Jump
-  // was ever attempted; Jump + Terms are harmless and must run
-  // first). The form can appear only once the page has scrolled to
-  // the bottom, so this check — after jump+scroll — is the one that
-  // sees the visible empty fields. The stop log names the step.
-  const cardField = needsPaymentDetails(document);
-  if (cardField) {
-    BOT.expressWalk = 'stopped';
-    clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
-    setStatus('CHECKOUT');
-    log('Express checkout STOPPED before Place order: the page needs card details filled in — the bot NEVER types card details or CVV. Add a saved payment method on RSI first, or finish the order yourself.');
-    notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
-    return { ok: false, reason: 'needs_payment_details' };
-  }
+  // v1.3.4: NO card-details guard here anymore — the guard (which
+  // ran at walk start in v1.3.2 and immediately before Place order
+  // in v1.3.3) is REMOVED entirely at Shariful's request: on the
+  // test account it kept stopping the walk even though the buyer
+  // WILL have a card saved on his RSI account. The Place-order
+  // enabled-wait below is now the SOLE backstop: with a saved
+  // payment method Place order enables and is clicked; without one
+  // it stays disabled and the walk stops at step 3 with a clear
+  // "add a saved payment method" message. The bot still NEVER types
+  // card details, CVV, expiry or name.
 
   // Step 3/3 — "Place order" (matched by data-testid). v1.3.2: it
   // stays DISABLED until the Terms box is checked AND a payment
@@ -1638,16 +1684,39 @@ async function runExpressCheckoutWalk(opts) {
  * themselves is left alone. A stale flag (older than 30 minutes) is
  * ignored and cleared. The express page keeps its own v1.3.0 boot
  * trigger and does not go through here. */
-function maybeResumeCheckout(delayMs) {
+function maybeResumeCheckout(delayMs, opts) {
   if (!isCartPage(window.location.pathname)) return false;
   const pending = loadCheckoutPending();
   if (!checkoutPendingValid(pending)) return false;
   log('Resuming the checkout walk on the cart page — a checkout is pending from the ' + (pending.source === 'api_add_to_cart' ? 'add-to-cart' : 'Buy Now') + ' step (' + pending.product + ').');
-  setTimeout(checkoutStepHandler, (delayMs === undefined ? 3000 : delayMs));
+  BOT.checkoutRetries = 0; // v1.3.4: fresh resume, fresh retry budget
+  setTimeout(function () { checkoutStepHandler(opts); }, (delayMs === undefined ? 3000 : delayMs));
   return true;
 }
 
-async function checkoutStepHandler() {
+/* v1.3.4: one failed cart-checkout attempt. Retries are bounded:
+ * after maxRetries failures the handler stops WITHOUT clearing the
+ * pending flag, so reloading the page resumes the checkout
+ * hands-off (the flag is only cleared when the walk finishes or
+ * stops with a clear reason). */
+function checkoutStepRetry(why, opts) {
+  opts = opts || {};
+  const retryDelayMs = opts.retryDelayMs === undefined ? 4000 : opts.retryDelayMs;
+  const maxRetries = opts.maxRetries === undefined ? CHECKOUT_STEP_MAX_RETRIES : opts.maxRetries;
+  BOT.checkoutRetries = (BOT.checkoutRetries || 0) + 1;
+  if (BOT.checkoutRetries >= maxRetries) {
+    log('Checkout step failed ' + BOT.checkoutRetries + ' times in a row (' + why + ') — stopping here. The pending checkout is KEPT: reload the page and the walk resumes by itself.');
+    notify('Checkout step failed', 'Reload the page — the checkout walk will resume by itself.');
+    return;
+  }
+  log(why + ' — retry ' + BOT.checkoutRetries + '/' + maxRetries + ' in a few seconds…');
+  setTimeout(function () { checkoutStepHandler(opts); }, retryDelayMs);
+}
+
+async function checkoutStepHandler(opts) {
+  opts = opts || {};
+  const retryDelayMs = opts.retryDelayMs === undefined ? 4000 : opts.retryDelayMs;
+  const enabledMs = opts.enabledMs === undefined ? 15000 : opts.enabledMs;
   // v1.3.0: the express checkout page has its own walk (Jump to bottom
   // -> Terms -> Place order), gated on Auto-Pay — it does not use the
   // cart's moveNext steps.
@@ -1655,38 +1724,64 @@ async function checkoutStepHandler() {
   if (!isCartPage(window.location.pathname)) return;
   const blocker = detectBlocker(document);
   if (blocker) { pauseBot('Checkout shows a ' + blocker + ' screen.'); return; }
-  const payText = (document.body.innerText || '').toLowerCase();
-  const onPaymentStep = /payment method|select.*payment|place order|pay now/.test(payText);
-  if (onPaymentStep && !BOT.config.autoPay) {
-    setStatus('CHECKOUT');
-    clearCheckoutPending(); // v1.3.1: the walk stopped here with a clear reason — no longer pending
-    log('STOPPED at the payment step — Auto-Pay is OFF. Pay yourself now, the ship is in your cart.');
-    notify('Ship in your cart — pay now!', 'Auto-Pay is OFF. Complete the payment yourself before stock runs out.');
-    return;
-  }
-  if (onPaymentStep && BOT.config.autoPay) {
-    log('Auto-Pay is ON: looking for an already-selected saved payment method. Card details are NEVER typed by this bot.');
-    const btn = Array.from(document.querySelectorAll('button')).find((b) => /place order|pay now|confirm/i.test(b.textContent || '') && !b.disabled);
-    if (btn) {
-      log('Clicking the Place Order button once with random human-like mouse movement (saved payment must already be selected).');
-      await humanClick(btn);
+  // v1.3.4: the payment step is detected by a REAL Place Order /
+  // Pay Now button in the DOM — NEVER by body text. The old
+  // body-text regex (/payment method|select.*payment|place order|
+  // pay now/) misfired on the plain cart page (the cart summary
+  // itself contains "payment method" text), so the handler thought
+  // the page was already on the payment step, found no enabled
+  // Place Order button, logged "pay yourself" and CLEARED the
+  // pending flag: dead end — the bot stopped on the checkout page
+  // and Shariful had to press Start again (live 2026-11-21 18:04).
+  const payBtnEl = findPlaceOrderLikeButtonEl(document);
+  if (payBtnEl) {
+    if (!BOT.config.autoPay) {
+      setStatus('CHECKOUT');
+      clearCheckoutPending(); // v1.3.1: the walk stopped here with a clear reason — no longer pending
+      log('STOPPED at the payment step — Auto-Pay is OFF. Pay yourself now, the ship is in your cart.');
+      notify('Ship in your cart — pay now!', 'Auto-Pay is OFF. Complete the payment yourself before stock runs out.');
+      return;
+    }
+    // Auto-Pay ON: the button may still be DISABLED (a saved payment
+    // method is still loading, or none is selected) — wait for it to
+    // become enabled instead of giving up on first sight (same
+    // lesson as v1.3.2: the React page renders asynchronously).
+    if (payBtnEl.disabled) {
+      log('The "Place order" button is disabled — waiting for it to become enabled (a saved payment method must be selected)…');
+      if (!(await waitForEnabled(payBtnEl, 'the "Place order" button', enabledMs))) {
+        setStatus('CHECKOUT');
+        clearCheckoutPending(); // the walk stopped here with a clear reason — no longer pending
+        log('STOPPED at the payment step — the "Place order" button never became enabled. No saved payment method is selected: add one on RSI first, or pay yourself. The bot NEVER types card details.');
+        notify('Place order is disabled', 'Add a saved payment method on RSI, then reload the page.');
+        return;
+      }
+    }
+    log('Clicking the Place Order button once with random human-like mouse movement (a saved payment method must already be selected — the bot NEVER types card details).');
+    if (await humanClick(payBtnEl)) {
       setStatus('DONE');
       clearCheckoutPending(); // v1.3.1: the checkout finished — no longer pending
-    } else {
-      log('Auto-Pay is ON but no enabled Place Order button was found — pay yourself.');
-      notify('Pay manually', 'No Place Order button found. Complete the payment yourself.');
-      clearCheckoutPending(); // v1.3.1: the walk stopped here with a clear reason — no longer pending
+      return;
     }
+    // The click did not land — retry it like any other failed step.
+    checkoutStepRetry('the Place Order button could not be clicked', opts);
     return;
   }
-  // Not on the payment step yet: advance one checkout step, then re-check.
+  // No Place Order button yet: the page is not on the payment step —
+  // advance one checkout step (moveNext), then re-check. RSI
+  // navigates to the next step (eventually express-checkout, where
+  // the walk runs). v1.3.4: a failed step used to kill the handler
+  // silently (the catch logged and never re-scheduled) — the bot
+  // stopped on the cart page. Now it retries, bounded, and keeps
+  // the pending flag so a reload resumes the checkout.
   try {
     await gql(buildNextStepMutation());
     log('Advanced one checkout step.');
+    BOT.checkoutRetries = 0;
   } catch (e) {
-    log('Checkout step failed: ' + e.message + ' — continue manually from the cart.');
+    checkoutStepRetry('checkout step failed: ' + e.message, opts);
+    return;
   }
-  setTimeout(checkoutStepHandler, 4000);
+  setTimeout(function () { checkoutStepHandler(opts); }, retryDelayMs);
 }
 
 /** Dry-run: one API stock check per watched product with a list ID, nothing added to cart. */
@@ -1850,7 +1945,7 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;max-width:calc(100vw - 24px);background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div id="scab-header" title="Drag to move the panel (double-click to reset position and size)" style="display:flex;justify-content:space-between;align-items:center;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;">' +
-    '<b>🚀 SC Auto Buyer v1.3.0</b>' +
+    '<b>🚀 SC Auto Buyer <span id="scab-version">v' + scabVersion() + '</span></b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
@@ -1989,10 +2084,14 @@ if (typeof module !== 'undefined' && module.exports) {
     isRectInViewport, pointHitsElement, scrollIntoViewAndSettle, humanClick,
     makeMouseEvent,
     isExpressCheckoutPage, findJumpToBottomButton, findTermsCheckbox,
-    findPlaceOrderButton, termsClickTarget, needsPaymentDetails,
+    findPlaceOrderButton, termsClickTarget,
     findJumpToBottomButtonEl, findPlaceOrderButtonEl,
+    findPlaceOrderLikeButtonEl, findPlaceOrderLikeButton,
+    checkoutStepHandler, checkoutStepRetry, CHECKOUT_STEP_MAX_RETRIES,
     waitForEl, waitForEnabled,
     runExpressCheckoutWalk,
+    scabVersion, SCAB_VERSION,
+    BOT,
     isCartPage, maybeResumeCheckout, saveCheckoutPending, loadCheckoutPending,
     clearCheckoutPending, checkoutPendingValid, clickBuyNowIfAvailable,
     clickReacted, waitForClickReaction,
