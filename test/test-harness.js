@@ -242,7 +242,7 @@ check('humanClick dispatches mousemove / mousedown / mouseup / click with random
 const checkoutFnSrc = (SRC.match(/async function checkoutStepHandler[\s\S]*?\n}/) || [''])[0];
 const walkFnSrc = (SRC.match(/async function runExpressCheckoutWalk[\s\S]*?\n}/) || [''])[0];
 check('Place Order uses humanClick, not instant btn.click()',
-  checkoutFnSrc.includes('await humanClick(btn)') && !/\.click\s*\(\)/.test(checkoutFnSrc) && !/\.click\s*\(\)/.test(walkFnSrc));
+  checkoutFnSrc.includes('await humanClick(payBtnEl)') && !/\.click\s*\(\)/.test(checkoutFnSrc) && !/\.click\s*\(\)/.test(walkFnSrc));
 check('loop checks DOM Buy Now before API (fallback if API lags)', SRC.includes('clickBuyNowIfAvailable()'));
 
 console.log('== 10. Start Monitor -> Buy Now path (v1.1.2) ==');
@@ -344,7 +344,8 @@ check('domBuyAllowed: unknown page price -> allowed (API is the strict cap)', bo
 check('panel has an "Add any product" form', SRC.includes('scab-add-url') && SRC.includes('scab-add-name') && SRC.includes('scab-add-price') && SRC.includes('scab-add-list') && SRC.includes('scab-add-btn'));
 check('panel rows have a Remove button', SRC.includes('data-scab-remove'));
 check('panel explains page-only entries', SRC.includes('page only'));
-check('panel version label is v1.3.0', SRC.includes('SC Auto Buyer v1.3.0'));
+check('panel version label shows the installed version (dynamic, not hardcoded)',
+  SRC.includes('scab-version') && SRC.includes('scabVersion()') && !SRC.includes('SC Auto Buyer v1.3.0'));
 check('clickBuyNowIfAvailable gates on entryMatchesPage (any watchlisted product)',
   SRC.includes('entryMatchesPage(w, window.location.href)'));
 check('clickBuyNowIfAvailable enforces the max price from the page', SRC.includes('domBuyAllowed(entry, price)'));
@@ -876,34 +877,18 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     bot.findPlaceOrderButton(docOf([fakeEl({ tag: 'button', text: 'Place order', testid: 'express-card-form-submit', disabled: true })])) === null);
   check('findPlaceOrderButton returns null when absent',
     bot.findPlaceOrderButton(docOf([])) === null);
-  // Card-details guard.
-  function cardInput(o) {
-    const el = fakeEl(Object.assign({ tag: 'input' }, o || {}));
-    el.type = (o && o.type) || 'text';
-    el.value = (o && o.value) || '';
-    return el;
-  }
-  check('needsPaymentDetails: visible empty card-number field (autocomplete cc-number) is found',
-    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number' })])) !== null);
-  check('needsPaymentDetails: visible empty CVV field (name) is found',
-    bot.needsPaymentDetails(docOf([cardInput({ name: 'cvv' })])) !== null);
-  check('needsPaymentDetails: visible empty expiry field (placeholder) is found',
-    bot.needsPaymentDetails(docOf([cardInput({ placeholder: 'MM / YY expiry' })])) !== null);
-  check('needsPaymentDetails: filled card field (saved card) does NOT count',
-    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number', value: '4111111111111111' })])) === null);
-  check('needsPaymentDetails: hidden card field does NOT count',
-    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number', hidden: true })])) === null);
-  check('needsPaymentDetails: the Terms checkbox itself does NOT count',
-    bot.needsPaymentDetails(docOf([termsInput])) === null);
-  check('needsPaymentDetails: no card fields -> null',
-    bot.needsPaymentDetails(docOf([])) === null);
+  // Card-details guard — REMOVED in v1.3.4 (Shariful's request):
+  // needsPaymentDetails() no longer exists, so there is nothing to
+  // unit-test here. The walk's only backstop for the no-payment case
+  // is now the Place-order enabled-wait (section 18 (s) + section
+  // 20 (d)).
   // Static: gating, wiring, exports.
   check('walk is gated on Auto-Pay (OFF returns before any find/click)',
     walkFnSrc.indexOf("if (!BOT.config.autoPay)") !== -1 &&
     walkFnSrc.indexOf("if (!BOT.config.autoPay)") < walkFnSrc.indexOf('waitForEl('));
   check('panel label says ON places the order itself', SRC.includes('ON = the bot places the order itself'));
-  check('walk checks for card details before Place order (never types them)',
-    SRC.includes('needsPaymentDetails(document)') && SRC.includes('NEVER types card details'));
+  check('walk has NO card-details guard anymore — the Place-order enabled-wait is the only backstop (v1.3.4)',
+    walkFnSrc.indexOf('needsPaymentDetails(document)') === -1 && walkFnSrc.indexOf('needs_payment_details') === -1 && walkFnSrc.indexOf('NEVER types card details') !== -1);
   check('checkoutStepHandler hands the express page to the walk',
     SRC.includes("isExpressCheckoutPage(window.location.pathname)) { await runExpressCheckoutWalk(); return; }"));
   check('panel boots the express walk on the express checkout page',
@@ -913,7 +898,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('walk never skips ahead: failures return via expressWalkFail',
     SRC.includes('expressWalkFail(') && SRC.includes('later steps will NOT run'));
   check('script exports the express helpers',
-    ['isExpressCheckoutPage', 'findJumpToBottomButton', 'findTermsCheckbox', 'findPlaceOrderButton', 'termsClickTarget', 'needsPaymentDetails', 'runExpressCheckoutWalk'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
+    ['isExpressCheckoutPage', 'findJumpToBottomButton', 'findTermsCheckbox', 'findPlaceOrderButton', 'termsClickTarget', 'runExpressCheckoutWalk'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
 
   // --- behavioral: the walk end-to-end in a fake express-checkout page ---
   global.MouseEvent = function (type, init) { this.type = type; if (init) { for (const k in init) this[k] = init[k]; } };
@@ -1069,18 +1054,22 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(d) missing Terms checkbox: log says the walk stopped and later steps will NOT run',
     envD.$('scab-log')._html.indexOf('STOPPED') !== -1 && envD.$('scab-log')._html.indexOf('later steps will NOT run') !== -1);
 
-  // (e) Payment form asking for card details: v1.3.3 — the walk
-  // runs Jump + Terms FIRST (the walk-start guard was removed: on a
-  // fully-rendered page it aborted the walk at step 0, live
-  // 2026-11-21 17:55) and stops BEFORE Place order.
+  // (e) Payment form asking for card details: v1.3.4 — the guard is
+  // GONE, so a visible empty card form no longer stops the walk.
+  // Place order is enabled here (a saved payment method), so the
+  // walk completes and clicks it. (The old v1.3.3 behaviour — stop
+  // before Place order — is gone by design; the no-payment case is
+  // now section 20 (d): Place order stays disabled and the walk
+  // stops at step 3 with the payment-method reason.)
   const envE = makeExpressEnv({ cardField: true });
   setAutoPay(envE, true);
   const resE = await envE.bot.runExpressCheckoutWalk();
-  check('(e) card details needed: walk stops before Place order', resE.ok === false && resE.reason === 'needs_payment_details', JSON.stringify(resE));
-  check('(e) card details needed: Jump + Terms ran, Place order was NEVER attempted',
-    envE.order.join(',') === 'jump,terms', envE.order.join(','));
-  check('(e) card details needed: log names the step it stopped at and says the bot NEVER types card details',
-    envE.$('scab-log')._html.indexOf('STOPPED before Place order') !== -1 && envE.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+  check('(e) card form present, Place order enabled: walk completes', resE.ok === true && resE.reason === 'placed', JSON.stringify(resE));
+  check('(e) card form present, Place order enabled: the three steps ran IN ORDER (jump -> terms -> place)',
+    envE.order.join(',') === 'jump,terms,place', envE.order.join(','));
+  check('(e) card form present, Place order enabled: no guard stop message anywhere',
+    envE.$('scab-log')._html.indexOf('STOPPED before Place order') === -1 &&
+    envE.$('scab-log')._html.indexOf('needs card details') === -1);
 
   console.log('== 17. Cart-page resume + click verification (v1.3.1) ==');
   // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.0, Auto-Pay ON):
@@ -1178,6 +1167,10 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
       if (o.reacts === 'navigate') {
         win.location.href = EXPRESS_URL;
         win.location.pathname = '/en/store/pledge/express-checkout';
+      } else if (o.reacts === 'cart') {
+        // v1.3.4: RSI navigates to the cart (not express) after Buy Now.
+        win.location.href = 'https://robertsspaceindustries.com/en/store/pledge/cart';
+        win.location.pathname = '/en/store/pledge/cart';
       } else if (o.reacts === 'disable') {
         btn.disabled = true;
       } else if (o.reacts === 'plain-only') {
@@ -1276,10 +1269,28 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     win.location.pathname = '/en/store/pledge/cart';
     const doc = makeFakeDocument();
     doc.body.innerText = o.bodyText || '';
+    // v1.3.4: optional Place Order button (the cart's payment step).
+    // Clickable like the express page's buttons: visible rect,
+    // offsetParent, elementFromPoint.
+    let payBtn = null;
+    const order = [];
+    if (o.payButton) {
+      payBtn = FakeEl('button', { text: 'Place order', cls: 'a-button' });
+      payBtn._rect = { left: 100, top: 300, width: 600, height: 50, right: 700, bottom: 350 };
+      payBtn.offsetParent = {};
+      payBtn.disabled = !!o.payButton.disabled;
+      payBtn.scrollIntoView = function (opts) {};
+      payBtn.addEventListener('click', () => order.push('place'));
+      doc.body.appendChild(payBtn);
+      doc.elementFromPoint = function (x, y) {
+        const r = payBtn._rect;
+        return (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) ? payBtn : null;
+      };
+    }
     const loaderN = new Function('module', 'exports', 'window', 'document', SRC);
     const moduleObjN = { exports: {} };
     loaderN(moduleObjN, moduleObjN.exports, win, doc);
-    return { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); } };
+    return { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); }, payBtn: payBtn, order: order };
   }
   // (j) Flag set: the cart page resumes the walk (boot schedules it).
   setPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
@@ -1367,13 +1378,9 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     bot.findJumpToBottomButtonEl(docOf([fakeEl({ tag: 'button', text: 'Jump to bottom', disabled: true })])) !== null);
   check('findPlaceOrderButtonEl returns a disabled Place order button',
     bot.findPlaceOrderButtonEl(docOf([fakeEl({ tag: 'button', text: 'Place order', testid: 'express-card-form-submit', disabled: true })])) !== null);
-  // --- pure: card guard sees hosted card fields in iframes ---
-  check('needsPaymentDetails: visible Stripe card iframe counts as card details needed',
-    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://js.stripe.com/v3/elements-inner-card-123' })])) !== null);
-  check('needsPaymentDetails: hidden card iframe does NOT count',
-    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://js.stripe.com/v3/elements-inner-card-123', hidden: true })])) === null);
-  check('needsPaymentDetails: iframe with an unrelated src does NOT count',
-    bot.needsPaymentDetails(docWith([fakeEl({ tag: 'iframe', src: 'https://www.youtube.com/embed/xyz' })])) === null);
+  // --- pure: card guard iframe tests REMOVED in v1.3.4 — the guard
+  // (needsPaymentDetails) no longer exists; the Place-order
+  // enabled-wait is the only backstop now (see section 20 (d)).
   // --- static: the walk waits ---
   check('walk waits for each step instead of failing on first sight',
     walkFnSrc2.indexOf('waitForEl(') !== -1 && walkFnSrc2.indexOf('waitForEnabled(') !== -1);
@@ -1416,17 +1423,19 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(s) disabled Place order: log says a saved payment method is needed',
     envS.$('scab-log')._html.indexOf('saved payment method') !== -1);
 
-  // (t) Card form renders LATE (after the Jump): the guard before
-  // Place order catches it (v1.3.3: there is only one guard now —
-  // the walk-start guard was removed).
+  // (t) Card form renders LATE (after the Jump): v1.3.4 — the guard
+  // is GONE, so a late card form no longer stops the walk. Place
+  // order is enabled here, so the walk completes: with a saved
+  // payment method the bot clicks Place order (that is the point).
   const envT = makeExpressEnv({ lateCardMs: 800 });
   setAutoPay(envT, true);
   const resT = await envT.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 5000 });
-  check('(t) late card form: walk stops at the guard before Place order', resT.ok === false && resT.reason === 'needs_payment_details', JSON.stringify(resT));
-  check('(t) late card form: Jump + Terms ran, Place order was NEVER attempted',
-    envT.order.join(',') === 'jump,terms', envT.order.join(','));
-  check('(t) late card form: log says the bot NEVER types card details',
-    envT.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+  check('(t) late card form: no guard anymore, walk completes', resT.ok === true && resT.reason === 'placed', JSON.stringify(resT));
+  check('(t) late card form: the three steps ran IN ORDER (jump -> terms -> place)',
+    envT.order.join(',') === 'jump,terms,place', envT.order.join(','));
+  check('(t) late card form: no guard stop message anywhere',
+    envT.$('scab-log')._html.indexOf('needs card details') === -1 &&
+    envT.$('scab-log')._html.indexOf('STOPPED before Place order') === -1);
 
   // (u) Jump NEVER appears: the walk fails at step 1 after waiting, with zero clicks.
   const envU = makeExpressEnv({ noJump: true });
@@ -1438,39 +1447,47 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(u) missing Jump: log says the button did not appear',
     envU.$('scab-log')._html.indexOf('did not appear') !== -1);
 
-  console.log('== 19. Walk-start card guard removed (v1.3.3) ==');
+  console.log('== 19. Walk-start card guard removed (v1.3.3) — guard now gone entirely (v1.3.4) ==');
   // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.2, Auto-Pay
   // ON, 17:55 Dhaka): the console showed ONLY "Express checkout
   // STOPPED: the page needs card details filled in" — no "walking
   // Jump to bottom → Terms → Place order…" line, no Jump click.
   // The card-details guard ran at WALK START, before step 1, and on
   // a fully-rendered page it saw the empty card form immediately
-  // and aborted the whole walk at step 0. The guard now runs ONLY
-  // immediately before Place order; Jump + Terms run first.
-  // --- static: no guard at walk start ---
+  // and aborted the whole walk at step 0. v1.3.3 moved the guard to
+  // just before Place order; v1.3.4 REMOVES it entirely at
+  // Shariful's request (it still stopped the walk on the test
+  // account, live 2026-11-21 18:04) — the Place-order enabled-wait
+  // is now the sole backstop (see section 20 (d)).
+  // --- static: no guard anywhere in the walk ---
   const walkFnSrc3 = (SRC.match(/async function runExpressCheckoutWalk[\s\S]*?\n}/) || [''])[0];
-  const walkStart = walkFnSrc3.indexOf("log('Express checkout (Auto-Pay ON): walking Jump to bottom");
-  check('no card-details guard before the walk start log',
-    walkStart !== -1 && walkFnSrc3.indexOf('needsPaymentDetails(document)') > walkStart);
-  check('the guard runs once, immediately before Place order',
-    (walkFnSrc3.match(/needsPaymentDetails\(document\)/g) || []).length === 1);
-  check('the guard-stop log names the step it stopped at',
-    walkFnSrc3.indexOf('STOPPED before Place order') !== -1);
+  check('no card-details guard anywhere in the walk',
+    (walkFnSrc3.match(/needsPaymentDetails/g) || []).length === 0 &&
+    walkFnSrc3.indexOf('needs_payment_details') === -1);
+  check('no guard-stop message anywhere in the walk',
+    walkFnSrc3.indexOf('STOPPED before Place order') === -1 &&
+    walkFnSrc3.indexOf('needs card details filled in') === -1);
+  check('the walk still never types card details (place_disabled message says so)',
+    walkFnSrc3.indexOf('NEVER types card details') !== -1);
 
-  // (a) Card form ALREADY rendered at walk start: Jump + Terms run,
-  // then the walk stops before Place order — Place order is NEVER
-  // clicked. (The exact live 17:55 failure.)
-  const env19A = makeExpressEnv({ cardField: true });
+  // (a) Card form ALREADY rendered at walk start + Place order
+  // DISABLED (no saved payment): v1.3.4 — no guard anymore, so the
+  // walk runs Jump + Terms, then stops at step 3 when Place order
+  // never enables, with a clear "add a saved payment method"
+  // message. (The exact live 17:55 page, minus the guard.)
+  const env19A = makeExpressEnv({ cardField: true, placeDisabled: true });
   setAutoPay(env19A, true);
-  const res19A = await env19A.bot.runExpressCheckoutWalk();
-  check('(a) card form present at walk start: walk stops before Place order',
-    res19A.ok === false && res19A.reason === 'needs_payment_details', JSON.stringify(res19A));
-  check('(a) card form present at walk start: Jump + Terms ran, Place order was NEVER attempted',
+  const res19A = await env19A.bot.runExpressCheckoutWalk({ presenceMs: 1000, enabledMs: 800 });
+  check('(a) card form + disabled Place order: walk stops at step 3 with the payment-method reason',
+    res19A.ok === false && res19A.reason === 'place_disabled_no_payment', JSON.stringify(res19A));
+  check('(a) card form + disabled Place order: Jump + Terms ran, Place order was NEVER clicked',
     env19A.order.join(',') === 'jump,terms', env19A.order.join(','));
-  check('(a) card form present at walk start: the walk start log ran (it got past step 0)',
+  check('(a) card form + disabled Place order: the walk start log ran (it got past step 0)',
     env19A.$('scab-log')._html.indexOf('walking Jump to bottom') !== -1);
-  check('(a) card form present at walk start: log names the step and says the bot NEVER types card details',
-    env19A.$('scab-log')._html.indexOf('STOPPED before Place order') !== -1 && env19A.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+  check('(a) card form + disabled Place order: log says a saved payment method is needed, no guard message',
+    env19A.$('scab-log')._html.indexOf('saved payment method') !== -1 &&
+    env19A.$('scab-log')._html.indexOf('STOPPED before Place order') === -1 &&
+    env19A.$('scab-log')._html.indexOf('needs card details') === -1);
 
   // (b) Saved payment present (filled card field, Place order
   // enabled): the guard does NOT stop the walk — all three steps run.
@@ -1492,6 +1509,302 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     env19C.order.join(',') === 'jump,terms', env19C.order.join(','));
   check('(c) late Jump + no saved payment: log says it waited for the button',
     env19C.$('scab-log')._html.indexOf('Waiting for') !== -1);
+  // Harness hygiene: this walk stopped at step 3, so its boot timer
+  // (firing at +3s) would re-run the walk in the background, wait
+  // ~15s for Place order, stop and CLEAR the shared pending flag
+  // while later (§20) tests are running — mark it done so the
+  // boot re-run returns immediately.
+  env19C.bot.BOT.expressWalk = 'done';
+
+  delete global.GM_getValue;
+  delete global.GM_setValue;
+
+  delete global.MouseEvent;
+
+  console.log('== 20. Card guard removed + cart auto-resume (v1.3.4) ==');
+  // REGRESSIONS (live 2026-11-21, First Flight Pack, 18:04 Dhaka):
+  // (1) the v1.3.3 guard still stopped the walk before Place order
+  // on the test account — Shariful asked for the restriction to go
+  // entirely ("ri restriction ta uthaiya daw"); (2) after the Buy
+  // Now click the bot stopped on the checkout page and had to be
+  // started again by hand — the cart handler misread the payment
+  // step from body text ("payment method" is in the cart summary
+  // itself), gave up ("pay yourself") and cleared the pending flag,
+  // and a failed moveNext killed it silently.
+  // The fakes deleted at the end of §19 are re-set here (the GM
+  // store is shared across loaders, like a real GM store surviving
+  // a page navigation).
+  global.MouseEvent = function (type, init) { this.type = type; if (init) { for (const k in init) this[k] = init[k]; } };
+  global.GM_getValue = function (k, d) { return (k in gmStore) ? gmStore[k] : (d === undefined ? null : d); };
+  global.GM_setValue = function (k, v) { gmStore[k] = v; };
+
+  // --- static: the guard is gone from the script entirely ---
+  check('the script no longer defines needsPaymentDetails at all',
+    SRC.indexOf('function needsPaymentDetails') === -1);
+  check('the walk never mentions the guard reason anymore',
+    walkFnSrc3.indexOf('needs_payment_details') === -1);
+  check('script exports the new cart helpers + version',
+    ['findPlaceOrderLikeButtonEl', 'findPlaceOrderLikeButton', 'checkoutStepHandler', 'checkoutStepRetry', 'scabVersion', 'SCAB_VERSION'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
+  // --- static: cart handler ---
+  const cshSrc20 = (SRC.match(/async function checkoutStepHandler[\s\S]*?\n}/) || [''])[0];
+  check('cart handler detects the payment step by a real button, never by body text',
+    cshSrc20.indexOf('document.body.innerText') === -1 &&
+    cshSrc20.indexOf('findPlaceOrderLikeButtonEl(document)') !== -1 &&
+    cshSrc20.indexOf('/payment method|select.*payment|place order|pay now/') === -1);
+  check('cart handler retries a failed step instead of dying silently',
+    cshSrc20.indexOf('checkoutStepRetry(') !== -1 && SRC.includes('function checkoutStepRetry'));
+  const csrSrc = (SRC.match(/function checkoutStepRetry[\s\S]*?\n}/) || [''])[0];
+  check('retries keep the pending flag when they run out (reload resumes)',
+    csrSrc.indexOf('clearCheckoutPending') === -1 && csrSrc.indexOf('KEPT') !== -1);
+  check('cart handler waits for a disabled Place Order button to enable',
+    cshSrc20.indexOf('waitForEnabled(payBtnEl') !== -1 && cshSrc20.indexOf('No saved payment method is selected') !== -1);
+  // --- static + pure: version display ---
+  check('panel header shows the version from the userscript metadata',
+    SRC.includes('scab-version') && SRC.includes('scabVersion()'));
+  check('scabVersion() returns the @version (fallback path, no GM_info in Node)',
+    bot.scabVersion() === '1.3.4');
+  check('@version metadata matches the SCAB_VERSION fallback',
+    /@version\s+1\.3\.4/.test(SRC) && bot.SCAB_VERSION === '1.3.4');
+  check('panel header no longer hardcodes a stale version',
+    SRC.indexOf('SC Auto Buyer v1.3.0') === -1);
+  // --- pure: Place-order-like finders ---
+  check('findPlaceOrderLikeButtonEl finds "Place order" by text',
+    bot.findPlaceOrderLikeButtonEl(docOf([fakeEl({ tag: 'button', text: 'Place order' })])) !== null);
+  check('findPlaceOrderLikeButtonEl finds "Pay now" by text',
+    bot.findPlaceOrderLikeButtonEl(docOf([fakeEl({ tag: 'button', text: 'Pay now' })])) !== null);
+  check('findPlaceOrderLikeButtonEl finds "Confirm order" by text',
+    bot.findPlaceOrderLikeButtonEl(docOf([fakeEl({ tag: 'button', text: 'Confirm order' })])) !== null);
+  check('findPlaceOrderLikeButtonEl ignores a bare "Confirm" (cookie banner) button',
+    bot.findPlaceOrderLikeButtonEl(docOf([fakeEl({ tag: 'button', text: 'Confirm' })])) === null);
+  check('findPlaceOrderLikeButton ignores a disabled Place order button',
+    bot.findPlaceOrderLikeButton(docOf([fakeEl({ tag: 'button', text: 'Place order', disabled: true })])) === null);
+  check('findPlaceOrderLikeButton returns null when there is no such button',
+    bot.findPlaceOrderLikeButton(docOf([fakeEl({ tag: 'button', text: 'Add to cart' })])) === null);
+
+  // Poll until a condition is true (or the timeout hits) — the
+  // multi-page tests below cannot use fixed sleeps: old envs' boot
+  // timers keep firing in the background and the shared GM store
+  // means a stale walk can clear the pending flag at any moment, so
+  // each step is observed as soon as it happens.
+  async function waitForCond(fn, timeoutMs, stepMs) {
+    const deadline = Date.now() + (timeoutMs === undefined ? 5000 : timeoutMs);
+    let v = null;
+    while (Date.now() < deadline) {
+      v = fn();
+      if (v) return v;
+      await sleepMs(stepMs === undefined ? 200 : stepMs);
+    }
+    return fn();
+  }
+
+  // --- behavioral: the panel renders the version ---
+  // (A cart env: an express env would schedule a boot walk that
+  // fires during the multi-page tests below and clears the shared
+  // pending flag — the version renders on every page.)
+  delete gmStore['scab_config'];
+  clearPending();
+  const envV = makeCartEnv();
+  check('panel renders a version element with the current version',
+    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.4') !== -1);
+
+  // --- behavioral: full multi-page flow, hands-off ---
+  // (a) Product page -> cart -> express-checkout: the walk
+  // auto-runs on the express page with NO Start press.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envA20 = makeBuyNowEnv({ reacts: 'cart' });
+  envA20.$('scab-start').click();
+  const flagA20 = await waitForCond(() => envA20.bot.loadCheckoutPending(), 4000);
+  check('(a) product page: Buy Now click saved the pending flag',
+    !!flagA20 && flagA20.source === 'dom_buy_now' && flagA20.product === 'Star Citizen First Flight Pack', JSON.stringify(flagA20));
+  check('(a) product page: bot navigated to the cart (RSI did not go to express directly)',
+    envA20.win.location.href === 'https://robertsspaceindustries.com/en/store/pledge/cart', envA20.win.location.href);
+  const realFetchA20 = global.fetch;
+  global.fetch = async () => ({ status: 200, ok: true, json: async () => ({}) });
+  const envCart20 = makeCartEnv();
+  const cartAdvanced20 = await waitForCond(() => envCart20.$('scab-log')._html.indexOf('Advanced one checkout step.') !== -1, 6000);
+  check('(a) cart page: the walk resumed from the flag',
+    envCart20.$('scab-log')._html.indexOf('Resuming the checkout walk on the cart page') !== -1);
+  check('(a) cart page: a checkout step ran', cartAdvanced20 === true);
+  check('(a) cart page: the flag stays while the walk is in progress',
+    !!envCart20.bot.loadCheckoutPending());
+  // RSI moves to express-checkout: a fresh page load, Auto-Pay
+  // already ON (pre-seeded config, as on the buyer's account).
+  gmStore['scab_config'] = JSON.stringify({ autoPay: true });
+  const envExp20 = makeExpressEnv();
+  const expDone20 = await waitForCond(() => envExp20.order.join(',') === 'jump,terms,place', 12000);
+  check('(a) express page: the walk auto-ran (no Start press)',
+    expDone20 === true, envExp20.order.join(','));
+  check('(a) express page: status is DONE',
+    envExp20.$('scab-status').textContent === 'DONE');
+  check('(a) express page: monitoring was never started (nobody pressed Start)',
+    envExp20.$('scab-log')._html.indexOf('Monitoring started') === -1);
+  check('(a) express page: the pending flag is cleared on DONE',
+    envExp20.bot.loadCheckoutPending() === null);
+  global.fetch = realFetchA20;
+  clearPending();
+  delete gmStore['scab_config'];
+
+  // (b) Product page -> express-checkout DIRECT: the walk auto-runs.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envB20 = makeBuyNowEnv({ reacts: 'navigate' });
+  envB20.$('scab-start').click();
+  const flagB20 = await waitForCond(() => envB20.bot.loadCheckoutPending(), 4000);
+  check('(b) direct path: Buy Now navigated straight to express checkout',
+    envB20.win.location.href === EXPRESS_URL, envB20.win.location.href);
+  check('(b) direct path: pending flag saved',
+    !!flagB20);
+  gmStore['scab_config'] = JSON.stringify({ autoPay: true });
+  const envExpB20 = makeExpressEnv();
+  const expDoneB20 = await waitForCond(() => envExpB20.order.join(',') === 'jump,terms,place', 12000);
+  check('(b) direct path: the walk auto-ran on the express page',
+    expDoneB20 === true, envExpB20.order.join(','));
+  check('(b) direct path: status is DONE',
+    envExpB20.$('scab-status').textContent === 'DONE');
+  clearPending();
+  delete gmStore['scab_config'];
+
+  // (c) Auto-Pay OFF: the boot-triggered walk refuses, zero clicks.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envC20 = makeExpressEnv();
+  const refused20 = await waitForCond(() => envC20.$('scab-log')._html.indexOf('Auto-Pay is OFF') !== -1, 8000);
+  check('(c) Auto-Pay OFF: the boot-triggered walk refuses', refused20 === true,
+    'log=' + envC20.$('scab-log')._html.slice(0, 500));
+  check('(c) Auto-Pay OFF: zero checkout clicks',
+    envC20.order.length === 0, envC20.order.join(','));
+  clearPending();
+
+  // (d) Guard removed: card form present + Place order DISABLED (no
+  // saved payment) -> Jump + Terms run, then the walk stops at step
+  // 3 with a clear "add a saved payment method" message.
+  const envD20 = makeExpressEnv({ cardField: true, placeDisabled: true });
+  setAutoPay(envD20, true);
+  const resD20 = await envD20.bot.runExpressCheckoutWalk({ presenceMs: 1000, enabledMs: 800 });
+  check('(d) guard removed: card form + disabled Place order stops at step 3 with the payment-method reason',
+    resD20.ok === false && resD20.reason === 'place_disabled_no_payment', JSON.stringify(resD20));
+  check('(d) guard removed: Jump + Terms ran, Place order was NEVER clicked',
+    envD20.order.join(',') === 'jump,terms', envD20.order.join(','));
+  check('(d) guard removed: log says a saved payment method is needed (clear "add it" message)',
+    envD20.$('scab-log')._html.indexOf('saved payment method') !== -1);
+  check('(d) guard removed: no guard stop message anywhere',
+    envD20.$('scab-log')._html.indexOf('needs card details') === -1 &&
+    envD20.$('scab-log')._html.indexOf('STOPPED before Place order') === -1);
+  // Harness hygiene (same as env19C above): this walk stopped at
+  // step 3, so its boot timer (firing at +3s) would re-run it in
+  // the background and clear the shared pending flag while the
+  // later §20 tests run — mark it done so the boot re-run returns
+  // immediately.
+  envD20.bot.BOT.expressWalk = 'done';
+  // (d2) Same card form, but Place order ENABLED (a saved payment
+  // method — the buyer's account): the walk completes and CLICKS
+  // Place order. This is the point of removing the guard.
+  const envD20b = makeExpressEnv({ cardField: true });
+  setAutoPay(envD20b, true);
+  const resD20b = await envD20b.bot.runExpressCheckoutWalk();
+  check('(d2) saved payment: card form present but Place order enabled -> walk completes',
+    resD20b.ok === true && resD20b.reason === 'placed', JSON.stringify(resD20b));
+  check('(d2) saved payment: the three steps ran IN ORDER (jump -> terms -> place)',
+    envD20b.order.join(',') === 'jump,terms,place', envD20b.order.join(','));
+  delete gmStore['scab_config'];
+
+  // (e) Cart page whose summary mentions "payment method" (like the
+  // real cart page): the old body-text regex misfired and gave up.
+  // Now the handler advances the step instead.
+  clearPending();
+  delete gmStore['scab_config'];
+  setPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  const realFetchE20 = global.fetch;
+  global.fetch = async () => ({ status: 200, ok: true, json: async () => ({}) });
+  const envE20 = makeCartEnv({ bodyText: 'Your cart — Payment method: select a payment method at checkout. Place order when ready.' });
+  await sleepMs(3800);
+  check('(e) cart page mentioning payment text: handler advances instead of giving up',
+    envE20.$('scab-log')._html.indexOf('Advanced one checkout step.') !== -1);
+  check('(e) cart page mentioning payment text: no "pay yourself" dead end',
+    envE20.$('scab-log')._html.indexOf('pay yourself') === -1);
+  global.fetch = realFetchE20;
+  clearPending();
+
+  // (f) moveNext keeps failing: the handler retries (bounded) and
+  // KEEPS the flag, so a reload resumes the checkout.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envF20 = makeCartEnv(); // no flag at boot -> no auto-schedule
+  envF20.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  const realFetchF20 = global.fetch;
+  global.fetch = async () => { throw new Error('network_down'); };
+  await envF20.bot.checkoutStepHandler({ retryDelayMs: 60, maxRetries: 3, enabledMs: 100 });
+  // Read this env's OWN per-loader log lines, not the panel HTML:
+  // the fake DOM shares one registry, so background cart ticks
+  // overwrite the newest env's panel log and would wipe these
+  // lines before a fixed sleep ends (the same cross-talk that
+  // made test (c) need polling).
+  const fLog20 = () => envF20.bot.BOT.logLines.join('\n');
+  const fKept20 = await waitForCond(() => fLog20().indexOf('KEPT') !== -1, 3000);
+  check('(f) failing step: handler retried instead of dying',
+    fLog20().indexOf('retry 1/3') !== -1, fLog20().slice(0, 300));
+  check('(f) failing step: after max retries it stops with the flag KEPT (reload resumes)',
+    fKept20 === true && !!envF20.bot.loadCheckoutPending(),
+    'log=' + fLog20().slice(0, 300) + ' flag=' + JSON.stringify(envF20.bot.loadCheckoutPending()));
+  global.fetch = realFetchF20;
+  clearPending();
+
+  // (g) Payment step with an enabled Place Order button + Auto-Pay
+  // ON: the handler clicks it, DONE, flag cleared.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envG20 = makeCartEnv({ payButton: {} });
+  envG20.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  setAutoPay(envG20, true);
+  await envG20.bot.checkoutStepHandler({ retryDelayMs: 60, enabledMs: 100 });
+  check('(g) payment step + Auto-Pay ON: Place Order clicked',
+    envG20.order.join(',') === 'place', envG20.order.join(','));
+  check('(g) payment step + Auto-Pay ON: status DONE + flag cleared',
+    envG20.$('scab-status').textContent === 'DONE' && envG20.bot.loadCheckoutPending() === null);
+  delete gmStore['scab_config'];
+
+  // (h) Payment step + Auto-Pay OFF: stops at payment, zero clicks.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envH20 = makeCartEnv({ payButton: {} });
+  envH20.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  await envH20.bot.checkoutStepHandler({ retryDelayMs: 60, enabledMs: 100 });
+  check('(h) payment step + Auto-Pay OFF: stops at payment, zero clicks',
+    envH20.order.length === 0 && envH20.$('scab-log')._html.indexOf('Auto-Pay is OFF') !== -1);
+  check('(h) payment step + Auto-Pay OFF: flag cleared',
+    envH20.bot.loadCheckoutPending() === null);
+  clearPending();
+
+  // (i) Place Order button DISABLED, then enabled (saved payment
+  // loading late): the handler waits and clicks it.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envI20 = makeCartEnv({ payButton: { disabled: true } });
+  envI20.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  setAutoPay(envI20, true);
+  setTimeout(() => { if (envI20.payBtn) envI20.payBtn.disabled = false; }, 150);
+  await envI20.bot.checkoutStepHandler({ retryDelayMs: 60, enabledMs: 2000 });
+  check('(i) disabled-then-enabled Place Order: waits and clicks it',
+    envI20.order.join(',') === 'place', envI20.order.join(','));
+  delete gmStore['scab_config'];
+  clearPending();
+
+  // (j) Place Order button NEVER enables (no saved payment): clear
+  // stop message, zero clicks, flag cleared (clear reason, like the
+  // express walk's place_disabled_no_payment).
+  clearPending();
+  delete gmStore['scab_config'];
+  const envJ20 = makeCartEnv({ payButton: { disabled: true } });
+  envJ20.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  setAutoPay(envJ20, true);
+  await envJ20.bot.checkoutStepHandler({ retryDelayMs: 60, enabledMs: 200 });
+  check('(j) Place Order never enables: stops with the saved-payment message, zero clicks',
+    envJ20.order.length === 0 && envJ20.$('scab-log')._html.indexOf('No saved payment method is selected') !== -1);
+  check('(j) Place Order never enables: flag cleared',
+    envJ20.bot.loadCheckoutPending() === null);
+  delete gmStore['scab_config'];
+  clearPending();
 
   delete global.GM_getValue;
   delete global.GM_setValue;
