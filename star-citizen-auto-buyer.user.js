@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.1
+// @version      1.3.2
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,46 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.1
+ * Star Citizen Auto Buyer — v1.3.2
  * =================================
+ * v1.3.2 FIX (2026-11-21): the express-checkout walk FAILED at step 1
+ *   on a REAL checkout page (First Flight Pack, 17:38 Dhaka, logged
+ *   in as QPPQMPMR9X, total $45.00): "the 'Jump to bottom' button was
+ *   not found" — yet a live browser inspection a minute later showed
+ *   the button EXISTS, VISIBLE ("JUMP TO BOTTOM", ~680x50, enabled).
+ *   Root cause: the React page renders asynchronously, and the walk
+ *   checked ONCE, 3s after panel boot, and failed permanently when
+ *   the button simply had not rendered yet. The finder lowercases
+ *   text, so the uppercase display text was NOT the problem. Now the
+ *   walk WAITS for each step's element instead of failing on first
+ *   sight: it polls every ~500ms, up to ~20s for an element to appear
+ *   and ~15s for it to become enabled, logging while it waits, and
+ *   only fails the step if it still has not appeared. The same live
+ *   inspection found two more real behaviours the walk must handle:
+ *   (a) the Terms checkbox is DISABLED until the page is scrolled to
+ *   the bottom — that is exactly what "Jump to bottom" is for — so
+ *   after step 1 the walk now waits for the checkbox to become
+ *   enabled before clicking it (matched ONLY by
+ *   data-testid="express-terms-checkbox", never by label text — the
+ *   live label reads "I agree to Terms & Conditions and certify that
+ *   I am over 18 years of age." — or by its React id); (b) the
+ *   "Place order" button stays DISABLED until the Terms box is
+ *   checked AND a payment method is selected, so after Terms the walk
+ *   waits for it to become enabled, and if it never does it stops
+ *   with a clear reason saying a saved payment method is needed — the
+ *   bot NEVER types card details. The card-details guard also runs
+ *   too early to see the form: it checked at walk start, before React
+ *   rendered the payment form (the live page HAS an empty card form —
+ *   card number, expiry, CVC/CVV, name on card — the test account has
+ *   NO saved payment method), so the first check passed even though
+ *   the form exists. The guard now ALSO runs after the jump+scroll,
+ *   when the form is rendered, and it now treats a VISIBLE iframe
+ *   whose src/name/title/id says card/payment as the same signal —
+ *   hosted card fields live inside cross-origin iframes the bot
+ *   cannot read into. Honest limit: if the card fields are hosted in
+ *   cross-origin iframes with no tell-tale src/name, the guard cannot
+ *   see them; the Place-order-disabled wait is then the backstop that
+ *   stops the walk. Harness 274 -> see section 18.
  * v1.3.1 FIX (2026-11-21): the bot STALLED on the cart page after Buy
  *   Now. The live run (First Flight Pack, 17:15 Dhaka) logged "Buy Now
  *   clicked" and then nothing — the panel log ran on the SAME product
@@ -1011,23 +1049,31 @@ function isCartPage(url) {
 }
 
 /**
- * Find the "Jump to bottom" button on the express checkout page.
- * Matched by its TEXT, not by class or data-cy-id alone — other
- * buttons on the page share those (class "a-button ... -fullWidth",
- * data-cy-id="button"). Exact text match first, then a contains match.
+ * Find the "Jump to bottom" button on the express checkout page,
+ * regardless of whether it is clickable yet — the walk waits for it
+ * to appear and become enabled separately. Matched by its TEXT, not
+ * by class or data-cy-id alone — other buttons on the page share
+ * those (class "a-button ... -fullWidth", data-cy-id="button").
+ * Exact text match first, then a contains match.
  */
-function findJumpToBottomButton(doc) {
+function findJumpToBottomButtonEl(doc) {
   const d = doc || document;
   const btns = d.querySelectorAll ? d.querySelectorAll('button') : [];
   for (const b of btns) {
     const t = (b.textContent || '').trim().toLowerCase();
-    if (t === 'jump to bottom' && isClickableEl(b)) return b;
+    if (t === 'jump to bottom') return b;
   }
   for (const b of btns) {
     const t = (b.textContent || '').trim().toLowerCase();
-    if (t.indexOf('jump to bottom') !== -1 && isClickableEl(b)) return b;
+    if (t.indexOf('jump to bottom') !== -1) return b;
   }
   return null;
+}
+
+/** The "Jump to bottom" button, only when it is visible and clickable. */
+function findJumpToBottomButton(doc) {
+  const el = findJumpToBottomButtonEl(doc);
+  return el && isClickableEl(el) ? el : null;
 }
 
 /**
@@ -1046,17 +1092,24 @@ function findTermsCheckbox(doc) {
 }
 
 /**
- * Find the "Place order" button on the express checkout page.
- * Matched by data-testid="express-card-form-submit", and only returned
- * when it is visible and clickable.
+ * Find the "Place order" button on the express checkout page,
+ * regardless of whether it is clickable yet — it stays DISABLED
+ * until the Terms box is checked and a payment method is selected,
+ * and the walk waits for it to become enabled. Matched by
+ * data-testid="express-card-form-submit".
  */
-function findPlaceOrderButton(doc) {
+function findPlaceOrderButtonEl(doc) {
   const d = doc || document;
   if (!d.querySelector) return null;
-  let el = null;
-  try { el = d.querySelector('[data-testid="express-card-form-submit"]'); } catch (e) { return null; }
-  if (!el || !isClickableEl(el)) return null;
-  return el;
+  try { return d.querySelector('[data-testid="express-card-form-submit"]'); } catch (e) { return null; }
+}
+
+/**
+ * The "Place order" button, only when it is visible and clickable.
+ */
+function findPlaceOrderButton(doc) {
+  const el = findPlaceOrderButtonEl(doc);
+  return el && isClickableEl(el) ? el : null;
 }
 
 /**
@@ -1112,6 +1165,27 @@ function needsPaymentDetails(doc) {
       hay = [el.getAttribute ? el.getAttribute('name') : '', el.getAttribute ? el.getAttribute('id') : '', el.getAttribute ? el.getAttribute('placeholder') : ''].join(' ').toLowerCase();
     } catch (e) { hay = ''; }
     if (/card.?number|cvv|cvc|expir|card.?holder|card.?name/.test(hay)) return el;
+  }
+  // v1.3.2: hosted card fields. A payment provider's card form often
+  // lives inside a cross-origin iframe (e.g. Stripe Elements) that
+  // the bot cannot read into — querySelectorAll('input') never sees
+  // those fields, and the iframe's own document is off-limits. A
+  // VISIBLE iframe whose src/name/title/id says card/payment is
+  // itself the signal that card details are being asked for, so it
+  // counts the same as a visible empty card field. Honest limit: an
+  // iframe with no tell-tale src/name cannot be recognised this way —
+  // the Place-order-disabled wait is then the backstop.
+  let frames = [];
+  try { frames = d.querySelectorAll('iframe'); } catch (e) { frames = []; }
+  for (const fr of frames) {
+    if (!fr || typeof fr.getBoundingClientRect !== 'function') continue;
+    const r = fr.getBoundingClientRect();
+    if (!r || r.width <= 0 || r.height <= 0) continue; // hidden iframe — not a form asking for input
+    let hay = '';
+    try {
+      hay = [fr.getAttribute ? fr.getAttribute('src') : '', fr.getAttribute ? fr.getAttribute('name') : '', fr.getAttribute ? fr.getAttribute('title') : '', fr.getAttribute ? fr.getAttribute('id') : ''].join(' ').toLowerCase();
+    } catch (e) { hay = ''; }
+    if (/card|stripe|cvv|cvc|secure|payment/.test(hay)) return fr;
   }
   return null;
 }
@@ -1359,6 +1433,54 @@ function expressWalkFail(reason, msg) {
   return { ok: false, reason: reason };
 }
 
+/* --- v1.3.2: wait for an element instead of failing on first sight ---
+ * The React checkout page renders asynchronously — at 3s after panel
+ * boot the "Jump to bottom" button simply had not rendered yet, and
+ * the walk failed permanently for an element that appeared moments
+ * later (live 2026-11-21). These helpers poll instead of checking
+ * once: waitForEl polls a finder until it returns an element,
+ * waitForEnabled polls until an element stops being disabled. Both
+ * log while waiting so the panel log shows the walk is working, not
+ * stuck, and only give up after their timeout. Timeouts are
+ * parameters (tests pass small ones) — production defaults are
+ * ~20s to appear, ~15s to become enabled. */
+async function waitForEl(findFn, doc, label, timeoutMs, intervalMs) {
+  const timeout = timeoutMs === undefined ? 20000 : timeoutMs;
+  const interval = intervalMs === undefined ? 500 : intervalMs;
+  const deadline = Date.now() + timeout;
+  let logged = false;
+  for (;;) {
+    let el = null;
+    try { el = findFn(doc); } catch (e) { el = null; }
+    if (el) {
+      if (logged) log('Found ' + label + '.');
+      return el;
+    }
+    if (Date.now() >= deadline) {
+      log('Still waiting for ' + label + ' — it did not appear after ~' + Math.round(timeout / 1000) + 's.');
+      return null;
+    }
+    if (!logged) { log('Waiting for ' + label + ' to appear…'); logged = true; }
+    await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
+  }
+}
+
+async function waitForEnabled(el, label, timeoutMs, intervalMs) {
+  const timeout = timeoutMs === undefined ? 15000 : timeoutMs;
+  const interval = intervalMs === undefined ? 500 : intervalMs;
+  const deadline = Date.now() + timeout;
+  let logged = false;
+  for (;;) {
+    if (el && !el.disabled) return true;
+    if (Date.now() >= deadline) {
+      log('Still waiting for ' + label + ' to become enabled — it stayed disabled after ~' + Math.round(timeout / 1000) + 's.');
+      return false;
+    }
+    if (!logged) { log('Waiting for ' + label + ' to become enabled…'); logged = true; }
+    await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
+  }
+}
+
 /**
  * Walk the express checkout page (.../store/pledge/express-checkout),
  * in order: (1) "Jump to bottom", (2) Terms of Service checkbox,
@@ -1374,7 +1496,12 @@ function expressWalkFail(reason, msg) {
  * The bot NEVER types card details or CVV. If the page shows a payment
  * form that still needs card details, the walk stops and alarms.
  */
-async function runExpressCheckoutWalk() {
+async function runExpressCheckoutWalk(opts) {
+  opts = opts || {};
+  // v1.3.2: how long to wait for each step's element to appear
+  // (~20s) and to become enabled (~15s). Tests pass small values.
+  const presenceMs = opts.presenceMs === undefined ? 20000 : opts.presenceMs;
+  const enabledMs = opts.enabledMs === undefined ? 15000 : opts.enabledMs;
   if (BOT.expressWalk === 'running' || BOT.expressWalk === 'done') return { ok: false, reason: 'already_' + BOT.expressWalk };
   BOT.expressWalk = 'running';
 
@@ -1409,21 +1536,32 @@ async function runExpressCheckoutWalk() {
   setStatus('CHECKOUT');
   log('Express checkout (Auto-Pay ON): walking Jump to bottom → Terms → Place order…');
 
-  // Step 1/3 — "Jump to bottom" (matched by its text).
-  await sleep(400);
-  const jumpBtn = findJumpToBottomButton(document);
-  if (!jumpBtn) return expressWalkFail('jump_not_found', 'the "Jump to bottom" button was not found on the express checkout page');
+  // Step 1/3 — "Jump to bottom" (matched by its text). v1.3.2: the
+  // React page renders asynchronously, so WAIT for the button to
+  // appear instead of failing on first sight — live 2026-11-21 the
+  // walk checked once at 3s and failed while the button appeared
+  // moments later.
+  const jumpBtn = await waitForEl(() => findJumpToBottomButtonEl(document), document, 'the "Jump to bottom" button', presenceMs);
+  if (!jumpBtn) return expressWalkFail('jump_not_found', 'the "Jump to bottom" button did not appear on the express checkout page after waiting ~' + Math.round(presenceMs / 1000) + 's — the page may still be loading; reload the page to try again');
+  if (!(await waitForEnabled(jumpBtn, 'the "Jump to bottom" button', enabledMs))) return expressWalkFail('jump_disabled', 'the "Jump to bottom" button stayed disabled after waiting ~' + Math.round(enabledMs / 1000) + 's');
   log('Express checkout: step 1/3 — clicking "Jump to bottom"…');
   if (!(await humanClick(jumpBtn))) return expressWalkFail('jump_not_clickable', 'the "Jump to bottom" button could not be clicked (not visible / covered after scrolling)');
   log('Express checkout: step 1/3 done — jumped to the bottom.');
   await sleep(700);
 
-  // Step 2/3 — Terms of Service checkbox (matched by data-testid, never by id).
-  const terms = findTermsCheckbox(document);
-  if (!terms) return expressWalkFail('terms_not_found', 'the Terms of Service checkbox was not found on the express checkout page');
+  // Step 2/3 — Terms of Service checkbox (matched by data-testid, never by id or label text).
+  const terms = await waitForEl(() => findTermsCheckbox(document), document, 'the Terms of Service checkbox', presenceMs);
+  if (!terms) return expressWalkFail('terms_not_found', 'the Terms of Service checkbox did not appear on the express checkout page after waiting ~' + Math.round(presenceMs / 1000) + 's');
   if (terms.checked) {
     log('Express checkout: step 2/3 — the Terms checkbox is already checked, skipping the click.');
   } else {
+    // v1.3.2: the checkbox is DISABLED until the page is scrolled to
+    // the bottom — that is what step 1 is for. Wait for it to become
+    // enabled instead of clicking a disabled box.
+    if (terms.disabled) {
+      log('Express checkout: step 2/3 — the Terms checkbox is disabled until the page is scrolled to the bottom; waiting for it to become enabled…');
+      if (!(await waitForEnabled(terms, 'the Terms of Service checkbox', enabledMs))) return expressWalkFail('terms_disabled', 'the Terms checkbox never became enabled — it stays disabled until the page is scrolled to the bottom');
+    }
     log('Express checkout: step 2/3 — checking the Terms of Service box…');
     const target = termsClickTarget(terms);
     if (!target || !(await humanClick(target))) return expressWalkFail('terms_not_clickable', 'the Terms checkbox could not be clicked (label / checkbox not visible / covered)');
@@ -1439,7 +1577,9 @@ async function runExpressCheckoutWalk() {
   await sleep(500);
 
   // Card-details guard again before the final click (the form can
-  // appear only once the page has scrolled to the bottom).
+  // appear only once the page has scrolled to the bottom — v1.3.2:
+  // the first check ran before React rendered the form, so this
+  // second check is the one that sees the visible empty fields).
   cardField = needsPaymentDetails(document);
   if (cardField) {
     BOT.expressWalk = 'stopped';
@@ -1450,9 +1590,17 @@ async function runExpressCheckoutWalk() {
     return { ok: false, reason: 'needs_payment_details' };
   }
 
-  // Step 3/3 — "Place order" (matched by data-testid).
-  const placeBtn = findPlaceOrderButton(document);
-  if (!placeBtn) return expressWalkFail('place_not_found', 'the "Place order" button was not found on the express checkout page');
+  // Step 3/3 — "Place order" (matched by data-testid). v1.3.2: it
+  // stays DISABLED until the Terms box is checked AND a payment
+  // method is selected, so wait for it to appear AND become enabled.
+  // If it never enables, the account has no usable payment method —
+  // stop with a clear reason instead of clicking a disabled button.
+  const placeBtn = await waitForEl(() => findPlaceOrderButtonEl(document), document, 'the "Place order" button', presenceMs);
+  if (!placeBtn) return expressWalkFail('place_not_found', 'the "Place order" button did not appear on the express checkout page after waiting ~' + Math.round(presenceMs / 1000) + 's');
+  if (placeBtn.disabled) {
+    log('Express checkout: step 3/3 — the "Place order" button is disabled; waiting for it to become enabled (it stays disabled until the Terms box is checked and a payment method is selected)…');
+    if (!(await waitForEnabled(placeBtn, 'the "Place order" button', enabledMs))) return expressWalkFail('place_disabled_no_payment', 'the "Place order" button never became enabled — it stays disabled until the Terms box is checked AND a payment method is selected. Add a saved payment method on RSI first — the bot NEVER types card details.');
+  }
   log('Express checkout: step 3/3 — clicking "Place order"…');
   if (!(await humanClick(placeBtn))) return expressWalkFail('place_not_clickable', 'the "Place order" button could not be clicked (not visible / covered after scrolling)');
   log('Express checkout: "Place order" clicked — check the order confirmation yourself. The bot never types card details.');
@@ -1823,6 +1971,8 @@ if (typeof module !== 'undefined' && module.exports) {
     makeMouseEvent,
     isExpressCheckoutPage, findJumpToBottomButton, findTermsCheckbox,
     findPlaceOrderButton, termsClickTarget, needsPaymentDetails,
+    findJumpToBottomButtonEl, findPlaceOrderButtonEl,
+    waitForEl, waitForEnabled,
     runExpressCheckoutWalk,
     isCartPage, maybeResumeCheckout, saveCheckoutPending, loadCheckoutPending,
     clearCheckoutPending, checkoutPendingValid, clickBuyNowIfAvailable,
