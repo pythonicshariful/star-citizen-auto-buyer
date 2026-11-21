@@ -96,11 +96,86 @@ check('script contains NO polling via location.href assignment except cart nav',
 check('script contains NO setInterval page refresh', !/setInterval\s*\(\s*\(\s*\)\s*=>\s*\{?\s*location/.test(SRC));
 check('script never fills CAPTCHA fields', !/captcha.*\.value\s*=|g-recaptcha-response/i.test(SRC.replace(/detectBlocker[\s\S]*?return null;/, '')));
 
-console.log('== 7. Blocker detection ==');
-check('detects captcha text', bot.detectBlocker('Please complete the captcha challenge') === 'captcha');
-check('detects queue text', bot.detectBlocker('You are in a queue, position 42') === 'queue');
-check('detects verify-human text', bot.detectBlocker('Verify you are human') === 'verify');
-check('normal page text -> no blocker', bot.detectBlocker('Kraken - Drake Interplanetary') === null);
+console.log('== 7. Blocker detection (v1.1.1 — visible challenge only) ==');
+// Minimal fake DOM for detectBlocker: elements carry the fields the
+// bot reads (tagName/src/className, offsetParent, getBoundingClientRect,
+// getAttribute, closest). Visible = offsetParent set + non-zero rect;
+// hidden = offsetParent null (no getComputedStyle in Node).
+function fakeEl(o) {
+  o = o || {};
+  return {
+    tagName: (o.tag || 'DIV').toUpperCase(),
+    src: o.src || '',
+    className: o.cls || '',
+    _sitekey: o.sitekey || null,
+    offsetParent: o.hidden ? null : {},
+    _rect: o.rect || { width: 300, height: 65 },
+    getBoundingClientRect: function () { return this._rect; },
+    getAttribute: function (n) {
+      if (n === 'src') return this.src || null;
+      if (n === 'data-sitekey') return this._sitekey;
+      return null;
+    },
+    closest: function (sel) { return (o.inBadge && sel === '.grecaptcha-badge') ? { className: 'grecaptcha-badge' } : null; },
+    parentNode: null,
+  };
+}
+function fakeDoc(o) {
+  o = o || {};
+  var els = o.els || [];
+  function selMatch(el, sel) {
+    sel = sel.trim();
+    var m = sel.match(/^iframe\[src\*="([^"]+)"\]$/);
+    if (m) return el.tagName === 'IFRAME' && (el.src || '').indexOf(m[1]) !== -1;
+    if (sel === '.g-recaptcha') return (el.className || '').split(/\s+/).indexOf('g-recaptcha') !== -1;
+    if (sel === '.h-captcha') return (el.className || '').split(/\s+/).indexOf('h-captcha') !== -1;
+    if (sel === '.cf-turnstile') return (el.className || '').split(/\s+/).indexOf('cf-turnstile') !== -1;
+    if (sel === '[data-sitekey]') return !!el._sitekey;
+    return false;
+  }
+  return {
+    body: { innerText: o.text || '' },
+    querySelectorAll: function (selector) {
+      var parts = String(selector).split(',');
+      return els.filter(function (el) { return parts.some(function (p) { return selMatch(el, p); }); });
+    },
+  };
+}
+var RSI_BADGE = 'https://www.google.com/recaptcha/api2/anchor?size=invisible&k=6LerBOgUAAAAAKPg6vsAFPTN66Woz-jBClxdQU-o';
+var RSI_NORMAL_TEXT = 'Star Citizen First Flight Pack $60.00\nprotected by reCAPTCHA\nPrivacy - Terms';
+// REGRESSION (v1.1.1 bug): a normal RSI page has the reCAPTCHA badge
+// text in its visible text and a badge iframe in its DOM — the bot
+// must NOT pause on Start Monitor when no challenge is shown.
+check('REGRESSION normal RSI page (badge text + badge iframe) -> no blocker',
+  bot.detectBlocker(fakeDoc({ text: RSI_NORMAL_TEXT, els: [fakeEl({ tag: 'iframe', src: RSI_BADGE, inBadge: true })] })) === null);
+check('REGRESSION bare word "captcha" in page text -> no blocker',
+  bot.detectBlocker(fakeDoc({ text: 'This site is protected by reCAPTCHA and the Google Privacy Policy' })) === null);
+check('REGRESSION hidden captcha iframe (display:none) -> no blocker',
+  bot.detectBlocker(fakeDoc({ text: 'Kraken - Drake Interplanetary', els: [fakeEl({ tag: 'iframe', src: 'https://www.google.com/recaptcha/api2/anchor?k=xxx', hidden: true })] })) === null);
+check('REGRESSION hidden .g-recaptcha widget -> no blocker',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ cls: 'g-recaptcha', hidden: true })] })) === null);
+check('REGRESSION badge iframe outside .grecaptcha-badge but size=invisible -> no blocker',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ tag: 'iframe', src: RSI_BADGE })] })) === null);
+// Real protection still intact: a genuinely visible challenge pauses.
+check('visible checkbox iframe -> captcha',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ tag: 'iframe', src: 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=xxx' })] })) === 'captcha');
+check('visible challenge popup iframe (bframe) -> captcha',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ tag: 'iframe', src: 'https://www.google.com/recaptcha/api2/bframe?k=xxx' })] })) === 'captcha');
+check('visible hCaptcha iframe -> captcha',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ tag: 'iframe', src: 'https://js.hcaptcha.com/1/api.js' })] })) === 'captcha');
+check('visible .g-recaptcha widget -> captcha',
+  bot.detectBlocker(fakeDoc({ text: '', els: [fakeEl({ cls: 'g-recaptcha' })] })) === 'captcha');
+check('detects "complete the captcha challenge" wording -> captcha',
+  bot.detectBlocker(fakeDoc({ text: 'Please complete the captcha challenge' })) === 'captcha');
+check('detects verify-human text -> verify',
+  bot.detectBlocker(fakeDoc({ text: 'Verify you are human' })) === 'verify');
+check('detects press & hold text -> verify',
+  bot.detectBlocker(fakeDoc({ text: 'Press & hold the button to continue' })) === 'verify');
+check('detects queue text', bot.detectBlocker(fakeDoc({ text: 'You are in a queue, position 42' })) === 'queue');
+check('detects access denied -> blocked',
+  bot.detectBlocker(fakeDoc({ text: 'Access denied — error 403' })) === 'blocked');
+check('normal page text -> no blocker', bot.detectBlocker(fakeDoc({ text: 'Kraken - Drake Interplanetary' })) === null);
+check('empty / null doc -> no blocker', bot.detectBlocker(null) === null && bot.detectBlocker({}) === null);
 
 console.log('== 8. Safety defaults ==');
 check('autoPay defaults OFF', bot.DEFAULT_CONFIG.autoPay === false);
