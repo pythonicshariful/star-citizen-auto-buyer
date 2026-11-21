@@ -992,8 +992,18 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
       card.offsetParent = {};
       doc.body.appendChild(card);
     }
+    // v1.3.3: a FILLED card field (a saved payment method) — the
+    // guard must NOT count it, so the walk completes.
+    if (o.savedCardField) {
+      const card = FakeEl('input', { attrs: { autocomplete: 'cc-number', name: 'cardNumber', placeholder: 'Card number' } });
+      card.type = 'text'; card.value = '4111111111111111';
+      card._rect = { left: 100, top: 200, width: 300, height: 40, right: 400, bottom: 240 };
+      card.offsetParent = {};
+      doc.body.appendChild(card);
+    }
     // v1.3.2: the card form renders LATE (after the Jump click) — the
-    // first guard must miss it and the second guard must catch it.
+    // guard before Place order must catch it (v1.3.3: the walk-start
+    // guard was removed, so this is the only guard).
     if (o.lateCardMs) {
       const card = FakeEl('input', { attrs: { autocomplete: 'cc-number', name: 'cardNumber', placeholder: 'Card number' } });
       card.type = 'text'; card.value = '';
@@ -1059,14 +1069,18 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(d) missing Terms checkbox: log says the walk stopped and later steps will NOT run',
     envD.$('scab-log')._html.indexOf('STOPPED') !== -1 && envD.$('scab-log')._html.indexOf('later steps will NOT run') !== -1);
 
-  // (e) Payment form asking for card details: the walk stops BEFORE any click.
+  // (e) Payment form asking for card details: v1.3.3 — the walk
+  // runs Jump + Terms FIRST (the walk-start guard was removed: on a
+  // fully-rendered page it aborted the walk at step 0, live
+  // 2026-11-21 17:55) and stops BEFORE Place order.
   const envE = makeExpressEnv({ cardField: true });
   setAutoPay(envE, true);
   const resE = await envE.bot.runExpressCheckoutWalk();
-  check('(e) card details needed: walk refuses', resE.ok === false && resE.reason === 'needs_payment_details', JSON.stringify(resE));
-  check('(e) card details needed: zero clicks', envE.order.length === 0, envE.order.join(','));
-  check('(e) card details needed: log says the bot NEVER types card details',
-    envE.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+  check('(e) card details needed: walk stops before Place order', resE.ok === false && resE.reason === 'needs_payment_details', JSON.stringify(resE));
+  check('(e) card details needed: Jump + Terms ran, Place order was NEVER attempted',
+    envE.order.join(',') === 'jump,terms', envE.order.join(','));
+  check('(e) card details needed: log names the step it stopped at and says the bot NEVER types card details',
+    envE.$('scab-log')._html.indexOf('STOPPED before Place order') !== -1 && envE.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
 
   console.log('== 17. Cart-page resume + click verification (v1.3.1) ==');
   // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.0, Auto-Pay ON):
@@ -1402,11 +1416,13 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(s) disabled Place order: log says a saved payment method is needed',
     envS.$('scab-log')._html.indexOf('saved payment method') !== -1);
 
-  // (t) Card form renders LATE (after the Jump): the first guard misses it, the second guard catches it.
+  // (t) Card form renders LATE (after the Jump): the guard before
+  // Place order catches it (v1.3.3: there is only one guard now —
+  // the walk-start guard was removed).
   const envT = makeExpressEnv({ lateCardMs: 800 });
   setAutoPay(envT, true);
   const resT = await envT.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 5000 });
-  check('(t) late card form: walk stops at the second guard', resT.ok === false && resT.reason === 'needs_payment_details', JSON.stringify(resT));
+  check('(t) late card form: walk stops at the guard before Place order', resT.ok === false && resT.reason === 'needs_payment_details', JSON.stringify(resT));
   check('(t) late card form: Jump + Terms ran, Place order was NEVER attempted',
     envT.order.join(',') === 'jump,terms', envT.order.join(','));
   check('(t) late card form: log says the bot NEVER types card details',
@@ -1421,6 +1437,61 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(u) missing Jump: zero clicks', envU.order.length === 0, envU.order.join(','));
   check('(u) missing Jump: log says the button did not appear',
     envU.$('scab-log')._html.indexOf('did not appear') !== -1);
+
+  console.log('== 19. Walk-start card guard removed (v1.3.3) ==');
+  // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.2, Auto-Pay
+  // ON, 17:55 Dhaka): the console showed ONLY "Express checkout
+  // STOPPED: the page needs card details filled in" — no "walking
+  // Jump to bottom → Terms → Place order…" line, no Jump click.
+  // The card-details guard ran at WALK START, before step 1, and on
+  // a fully-rendered page it saw the empty card form immediately
+  // and aborted the whole walk at step 0. The guard now runs ONLY
+  // immediately before Place order; Jump + Terms run first.
+  // --- static: no guard at walk start ---
+  const walkFnSrc3 = (SRC.match(/async function runExpressCheckoutWalk[\s\S]*?\n}/) || [''])[0];
+  const walkStart = walkFnSrc3.indexOf("log('Express checkout (Auto-Pay ON): walking Jump to bottom");
+  check('no card-details guard before the walk start log',
+    walkStart !== -1 && walkFnSrc3.indexOf('needsPaymentDetails(document)') > walkStart);
+  check('the guard runs once, immediately before Place order',
+    (walkFnSrc3.match(/needsPaymentDetails\(document\)/g) || []).length === 1);
+  check('the guard-stop log names the step it stopped at',
+    walkFnSrc3.indexOf('STOPPED before Place order') !== -1);
+
+  // (a) Card form ALREADY rendered at walk start: Jump + Terms run,
+  // then the walk stops before Place order — Place order is NEVER
+  // clicked. (The exact live 17:55 failure.)
+  const env19A = makeExpressEnv({ cardField: true });
+  setAutoPay(env19A, true);
+  const res19A = await env19A.bot.runExpressCheckoutWalk();
+  check('(a) card form present at walk start: walk stops before Place order',
+    res19A.ok === false && res19A.reason === 'needs_payment_details', JSON.stringify(res19A));
+  check('(a) card form present at walk start: Jump + Terms ran, Place order was NEVER attempted',
+    env19A.order.join(',') === 'jump,terms', env19A.order.join(','));
+  check('(a) card form present at walk start: the walk start log ran (it got past step 0)',
+    env19A.$('scab-log')._html.indexOf('walking Jump to bottom') !== -1);
+  check('(a) card form present at walk start: log names the step and says the bot NEVER types card details',
+    env19A.$('scab-log')._html.indexOf('STOPPED before Place order') !== -1 && env19A.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+
+  // (b) Saved payment present (filled card field, Place order
+  // enabled): the guard does NOT stop the walk — all three steps run.
+  const env19B = makeExpressEnv({ savedCardField: true });
+  setAutoPay(env19B, true);
+  const res19B = await env19B.bot.runExpressCheckoutWalk();
+  check('(b) saved payment present: walk completes', res19B.ok === true && res19B.reason === 'placed', JSON.stringify(res19B));
+  check('(b) saved payment present: the three steps ran IN ORDER (jump -> terms -> place)',
+    env19B.order.join(',') === 'jump,terms,place', env19B.order.join(','));
+
+  // (c) Jump renders LATE + no saved payment: the walk still waits
+  // for Jump, runs Jump + Terms, then stops at step 3.
+  const env19C = makeExpressEnv({ lateJumpMs: 1200, placeDisabled: true });
+  setAutoPay(env19C, true);
+  const res19C = await env19C.bot.runExpressCheckoutWalk({ presenceMs: 5000, enabledMs: 800 });
+  check('(c) late Jump + no saved payment: walk stops at step 3 with the payment-method reason',
+    res19C.ok === false && res19C.reason === 'place_disabled_no_payment', JSON.stringify(res19C));
+  check('(c) late Jump + no saved payment: Jump + Terms ran, Place order was NEVER clicked',
+    env19C.order.join(',') === 'jump,terms', env19C.order.join(','));
+  check('(c) late Jump + no saved payment: log says it waited for the button',
+    env19C.$('scab-log')._html.indexOf('Waiting for') !== -1);
 
   delete global.GM_getValue;
   delete global.GM_setValue;
