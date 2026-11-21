@@ -124,26 +124,26 @@ Do this before any real release, so you know it works:
 - Keep the poll speed as set (8–15 seconds). Faster checking looks
   more like a bot and can get the account blocked.
 
-## What is proven / not proven (v1.2.1, 2026-11-21)
+## What is proven / not proven (v1.2.2, 2026-11-21)
 
 | | Status |
 |---|---|
 | Stock check via RSI's own GraphQL API | ✅ Proven live — Kraken correctly shows "not listed" while out of stock; PTV ($15) and First Flight Pack ($60) correctly show in stock; Pioneer correctly shows out of stock |
-| Picking the Warbond version under the max price | ✅ Proven — 169/169 automated tests (`node test/test-harness.js`) |
+| Picking the Warbond version under the max price | ✅ Proven — 180/180 automated tests (`node test/test-harness.js`) |
 | Add any product from the panel (ship / package / vehicle) | ✅ Proven in harness — URL + max price validated, name read from the URL, list ID optional; a product NOT in the watchlist never clicks. **Not live-proven in a real browser yet** |
 | Page-only products (no list ID) | ✅ Proven in harness — API check skipped, DOM Buy Now path watches the product's own page; the page must stay open. **Not live-proven in a real browser yet** |
 | Max price respected on the Buy Now click too | ✅ Proven in harness — page price above the cap does NOT click |
 | CAPTCHA pause only on a real visible challenge | ✅ Fixed in v1.1.1 — a normal RSI page (reCAPTCHA badge text in the page, badge iframe in the DOM) no longer pauses the bot on Start; a genuinely visible challenge (checkbox / image challenge / hCaptcha) still pauses + alarms. Regression-tested |
-| Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 (page matching) and v1.2.1 (scroll-then-click, below) — the DOM Buy Now click never fired for any "Name - 10 Year" ship, and the click used a stale position while the smooth scroll was still running. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages). **Still needs a real-browser check:** open the test ship's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
+| Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 (page matching), v1.2.1 (scroll-then-click) and v1.2.2 (MouseEvent fix, below) — the DOM Buy Now click never fired for any "Name - 10 Year" ship, the click used a stale position while the smooth scroll was still running, and then the mouse event itself failed to build inside Tampermonkey ("Failed to construct 'MouseEvent' … 'view' … 'Window'") so nothing was clicked even with the button found and the price under max. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages; sandbox-mimicking MouseEvent test). **Still needs a real-browser check:** open the test product's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
 | No page-refresh polling | ✅ Proven — the script contains no page refresh; only API calls |
-| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (169 checks) — the bot scrolls the button into view FIRST, waits for the scroll/layout to settle, re-reads the position, checks the button is really visible and not covered, then random point, curved path, random hover/hold timings; a covered / off-screen / disabled button is NOT clicked. **Not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (180 checks) — the bot scrolls the button into view FIRST, waits for the scroll/layout to settle, re-reads the position, checks the button is really visible and not covered, then random point, curved path, random hover/hold timings; a covered / off-screen / disabled button is NOT clicked. **v1.2.2:** the mouse events are now built without a `view` property, so they construct inside the Tampermonkey sandbox (the old `view: window` threw "Failed to construct 'MouseEvent'" on a real page and nothing was clicked). **Not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
 | Panel draggable + resizable | ✅ Proven in harness — drag the header to move, drag the bottom-right corner to resize (width 20–60%, height 25–90% of the window, same as the Microsoft bot); position/size save in Tampermonkey storage and restore on every page; double-click the header to reset. **Not live-proven in a real browser yet** |
 | Every panel button works | ✅ Proven in harness (fake-browser test) — Start starts monitoring, Stop stops it (and clears a PAUSED state), Test runs a dry-run check, Add product adds + rejects duplicates, Remove (✕) removes that product, Auto-Pay checkbox flips the setting. **Not live-proven in a real browser yet** |
 | Add-to-cart + checkout steps | ⚠️ Built from RSI's own store code, **not yet proven live** — needs a test in a real logged-in browser with a cheap in-stock item, stopping before payment |
 | Buying a Kraken in a real wave | ❌ Not proven — no wave was live during testing, and no real purchase was made |
 
 Test evidence: `test/live-test-2026-11-21.json` (live API results),
-`test/test-harness.js` (169 checks), `RESEARCH.md` (full findings).
+`test/test-harness.js` (180 checks), `RESEARCH.md` (full findings).
 
 ## Files
 
@@ -155,6 +155,8 @@ Test evidence: `test/live-test-2026-11-21.json` (live API results),
 - `test/fixtures/` — real + synthetic API responses used by the tests
 
 ## Version
+
+v1.2.2 — 2026-11-21. Fixed the mouse-click error that stopped Buy Now from working on a real page: the button was found and the price guard passed, but the click never happened — "Failed to construct 'MouseEvent': Failed to read the 'view' property from 'UIEventInit': Failed to convert value to 'Window'." Cause: the bot passed `view: window` to `new MouseEvent(...)`, but inside Tampermonkey the script's `window` is a sandbox proxy, not the page's real Window, so the constructor rejects it. `view` is optional (it defaults to null and no click handler reads it), so it is simply not passed anymore, with a legacy createEvent / initMouseEvent fallback if the modern constructor ever throws. A click failure is now also logged plainly ("Buy Now click FAILED … will retry on the next tick") instead of hiding behind "continuing with API checks", and the loop retries the DOM click on the next tick while the button is still available. Harness 180/180 (11 new checks in section 15, including a sandbox-mimicking MouseEvent test that reproduces the exact live error). No change to scroll-then-click, the any-product watchlist, API-only stock checks, max-price guard, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
 v1.2.1 — 2026-11-21. The Buy Now click now scrolls FIRST and only then clicks: the old code scrolled smooth and read the button position after a fixed 200–600 ms, but on a long product page the smooth scroll was still running, so the click used a stale position and "did nothing" on a real page. Now the bot scrolls instantly, waits for the scroll + layout to settle, re-reads the position, checks the button is really visible and not covered, and only then moves the mouse (random curved path, random point) and clicks — a covered / off-screen / disabled button is never clicked blind. The panel is now draggable by its header and resizable from the bottom-right corner (same as the Microsoft bot: width 20–60%, height 25–90% of the window, position/size saved and restored; double-click the header to reset). Every panel button was audited and behaviorally tested — Start, Stop (now also clears a PAUSED state), Test dry-run, Add product, Remove (✕) per product, Auto-Pay checkbox — all work. Harness 169/169. No change to the any-product watchlist, API-only stock checks, max-price guard, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
