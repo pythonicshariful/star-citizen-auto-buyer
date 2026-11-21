@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.0
+// @version      1.3.1
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,34 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.0
+ * Star Citizen Auto Buyer — v1.3.1
  * =================================
+ * v1.3.1 FIX (2026-11-21): the bot STALLED on the cart page after Buy
+ *   Now. The live run (First Flight Pack, 17:15 Dhaka) logged "Buy Now
+ *   clicked" and then nothing — the panel log ran on the SAME product
+ *   page for 7 minutes, no checkout walk ever started. Two causes:
+ *   (1) after the click the bot navigates to the cart, but the cart
+ *   page loads with a brand-new BOT (BOT.found is null there), and the
+ *   panel only resumed the checkout walk "if (.../cart... && BOT.found)"
+ *   — so the walk NEVER resumed; the same dead end hit the API path,
+ *   where a setTimeout(checkoutStepHandler, 4000) was scheduled and
+ *   then the page navigated, killing the timer. Now the bot saves a
+ *   "checkout pending" flag in Tampermonkey storage BEFORE navigating
+ *   (which product, how it got there, when), and the cart page resumes
+ *   the checkout walk from that flag — a cart page WITHOUT the flag
+ *   starts no walk, so a cart the user opened themselves is left
+ *   alone. The flag is cleared when the walk finishes (DONE), when it
+ *   stops with a clear reason, or when the user presses Stop; a flag
+ *   older than 30 minutes is treated as stale and ignored. (The
+ *   express-checkout page keeps its v1.3.0 3-second walk trigger,
+ *   gated on Auto-Pay.) (2) "Buy Now clicked" only meant the synthetic
+ *   events dispatched without throwing — it never checked whether RSI
+ *   actually reacted. Now the bot waits briefly after the click and
+ *   checks the page reacted (navigating, or the button changed); if
+ *   nothing happened it says so plainly and retries ONCE with a plain
+ *   element.click() before giving up for that tick — and it never
+ *   claims "clicked" when nothing reacted, and never forces the cart
+ *   navigation when RSI is already navigating to express checkout.
  * v1.3.0 (2026-11-21): express-checkout walk. When the page is the
  *   express checkout page (.../store/pledge/express-checkout) the bot
  *   now walks the final three steps in order, ONLY when Auto-Pay is
@@ -694,6 +720,50 @@ function loadConfig() {
   } catch (e) {}
 }
 
+/* --- v1.3.1 checkout-pending flag (Tampermonkey storage) ---
+ * WHY: after Buy Now / add-to-cart the bot navigates to the cart, and
+ * the cart page loads with a brand-new BOT — in-memory state (BOT.found,
+ * timers) does NOT survive the navigation. The old panel boot resumed
+ * the checkout walk only "if (.../cart... && BOT.found)", which is
+ * always false on a fresh page load, so the bot sat idle on the cart
+ * page (live bug 2026-11-21). The flag is saved BEFORE navigating and
+ * read on the next page's boot. Shape: { source, product, skuId,
+ * maxPrice, at } — source is 'dom_buy_now' or 'api_add_to_cart'.
+ * Cleared when the walk finishes (DONE), when it stops with a clear
+ * reason, or when the user presses Stop. A flag older than 30 minutes
+ * is stale (e.g. a crashed session) and is ignored + cleared.
+ * When Tampermonkey storage is unavailable (tests), an in-memory
+ * fallback is used instead. */
+const CHECKOUT_PENDING_KEY = 'scab_checkout_pending';
+const CHECKOUT_PENDING_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+var checkoutPendingMemory = null;
+function saveCheckoutPending(pending) {
+  try {
+    if (hasGM) { GM_setValue(CHECKOUT_PENDING_KEY, JSON.stringify(pending || null)); return; }
+  } catch (e) {}
+  try { checkoutPendingMemory = pending || null; } catch (e) {}
+}
+function loadCheckoutPending() {
+  try {
+    if (hasGM) {
+      const raw = GM_getValue(CHECKOUT_PENDING_KEY, null);
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch (e) { return null; }
+    }
+  } catch (e) {}
+  return checkoutPendingMemory;
+}
+function clearCheckoutPending() { saveCheckoutPending(null); }
+/** True when the saved flag is usable: present and not stale. A stale flag is cleared. */
+function checkoutPendingValid(pending) {
+  if (!pending || typeof pending !== 'object') return false;
+  if (!pending.at || (Date.now() - Number(pending.at)) > CHECKOUT_PENDING_MAX_AGE_MS) {
+    clearCheckoutPending();
+    return false;
+  }
+  return true;
+}
+
 function beep() {
   if (!BOT.config.soundAlert) return;
   try {
@@ -933,6 +1003,13 @@ function isExpressCheckoutPage(url) {
   return u.indexOf('express-checkout') !== -1;
 }
 
+/** True when the URL is RSI's cart page (.../store/pledge/cart). */
+function isCartPage(url) {
+  const u = String(url || '').toLowerCase();
+  if (!u) return false;
+  return u.indexOf('/store/pledge/cart') !== -1;
+}
+
 /**
  * Find the "Jump to bottom" button on the express checkout page.
  * Matched by its TEXT, not by class or data-cy-id alone — other
@@ -1039,6 +1116,33 @@ function needsPaymentDetails(doc) {
   return null;
 }
 
+/* --- v1.3.1: did the Buy Now click actually do anything? ---
+ * "Buy Now clicked" used to mean only that the synthetic events
+ * dispatched without throwing — the live 2026-11-21 run logged it
+ * while the page never moved. A dispatched click is not a bought
+ * item: the page has to react (start navigating, or the button has
+ * to change — disabled, or removed from the page). */
+function clickReacted(beforeHref, btn) {
+  try {
+    if (typeof window !== 'undefined' && window && window.location && window.location.href !== beforeHref) return true;
+  } catch (e) {}
+  try {
+    if (btn && btn.disabled) return true;
+  } catch (e) {}
+  try {
+    if (typeof document !== 'undefined' && document && typeof document.contains === 'function' && btn && !document.contains(btn)) return true;
+  } catch (e) {}
+  return false;
+}
+async function waitForClickReaction(beforeHref, btn, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs === undefined ? 2000 : timeoutMs);
+  while (Date.now() < deadline) {
+    if (clickReacted(beforeHref, btn)) return true;
+    await sleep(200);
+  }
+  return clickReacted(beforeHref, btn);
+}
+
 /** If a Buy Now button is available on a watched product's page, click it human-like. */
 async function clickBuyNowIfAvailable() {
   if (!BOT.config.humanClick) return false;
@@ -1058,10 +1162,30 @@ async function clickBuyNowIfAvailable() {
     return false;
   }
   if (gate.reason === 'price_unknown') log(entry.name + ': page price could not be read — clicking per your max $' + entry.maxPrice + ' (the API check is the strict cap).');
+  const beforeHref = (typeof window !== 'undefined' && window && window.location) ? window.location.href : '';
   log('Buy Now button is available for ' + entry.name + ' — clicking it with random human-like mouse movement…');
   const ok = await humanClick(btn);
-  if (ok) log('Buy Now clicked (human-like path).');
-  return ok;
+  if (!ok) return false;
+  // v1.3.1: a dispatched click is not a bought item — verify the page
+  // actually reacted. The live 2026-11-21 run logged "Buy Now clicked"
+  // while the page never moved, and the bot then claimed success.
+  // The first wait is deliberately ~2s: RSI's button disables or the
+  // page starts navigating well within that on a working click, so a
+  // slow-but-working click is not mistaken for an ignored one and
+  // double-clicked.
+  let reacted = await waitForClickReaction(beforeHref, btn, 2000);
+  if (!reacted && isClickableEl(btn)) {
+    log('Buy Now click dispatched but the page did not react — retrying once with a plain click…');
+    try { btn.click(); } catch (e) { log('Plain click retry failed: ' + (e && e.message ? e.message : e) + ' — will retry on the next tick.'); return false; }
+    reacted = await waitForClickReaction(beforeHref, btn, 2000);
+  }
+  if (!reacted) {
+    log('Buy Now click did NOT move the page even after a plain click retry — the button may need a real mouse click. NOT navigating to the cart; will retry on the next tick.');
+    return false;
+  }
+  const navigating = (typeof window !== 'undefined' && window && window.location) ? window.location.href !== beforeHref : false;
+  log('Buy Now clicked (human-like path) — the page reacted' + (navigating ? ' (already navigating)' : '') + '.');
+  return { entry: entry, alreadyNavigating: navigating };
 }
 
 async function gql(body) {
@@ -1127,10 +1251,19 @@ async function loopTick() {
   // v1.1.0: if a Buy Now button is already showing on a watched ship
   // page, click it human-like right away (API list can lag the page).
   try {
-    if (await clickBuyNowIfAvailable()) {
+    const clicked = await clickBuyNowIfAvailable();
+    if (clicked) {
       setStatus('IN STOCK');
-      notify('Buy Now clicked!', 'The Buy Now button was available and clicked with human-like mouse movement. Check the cart now.');
-      window.location.href = RSI_ORIGIN + '/store/pledge/cart';
+      notify('Buy Now clicked!', 'The Buy Now button was available and clicked with human-like mouse movement. Continuing to checkout…');
+      // v1.3.1: persist the checkout BEFORE leaving the page — the next
+      // page load starts with a fresh BOT, so without this the cart
+      // page never knows a checkout is in progress (live bug
+      // 2026-11-21: the bot sat idle on the cart page).
+      saveCheckoutPending({ source: 'dom_buy_now', product: clicked.entry.name, maxPrice: clicked.entry.maxPrice, at: Date.now() });
+      // RSI's own Buy Now flow may already be navigating to express
+      // checkout — do not override that with a cart navigation; the
+      // pending flag lets the walk resume on whichever page we land on.
+      if (!clicked.alreadyNavigating) window.location.href = RSI_ORIGIN + '/store/pledge/cart';
       return;
     }
   } catch (e) {
@@ -1166,6 +1299,10 @@ function startLoop() {
   if (BOT.status === 'MONITORING') return;
   BOT.errors = 0;
   BOT.found = null;
+  // v1.3.1: a fresh monitoring run drops any stale checkout-pending
+  // flag from an abandoned checkout, so it can never resume a walk
+  // later by surprise.
+  clearCheckoutPending();
   setStatus('MONITORING');
   log('Monitoring started — API checks every ~' + Math.round(BOT.config.pollMinMs / 1000) + '-' + Math.round(BOT.config.pollMaxMs / 1000) + 's. No page refresh.');
   loopTick();
@@ -1174,6 +1311,10 @@ function startLoop() {
 function stopLoop() {
   clearTimeout(BOT.timer);
   BOT.timer = null;
+  // v1.3.1: Stop also clears a pending checkout, so pressing Stop ends
+  // the checkout walk too (and a pause, which calls stopLoop first,
+  // clears it as well — a paused checkout never resumes by itself).
+  clearCheckoutPending();
   // v1.2.1: Stop also clears a PAUSED state, so the button does what it
   // says after a pause. (pauseBot calls stopLoop() first and sets PAUSED
   // after, so this never clears a fresh pause.)
@@ -1195,11 +1336,13 @@ async function addToCartAndCheckout(found) {
     return;
   }
   setStatus('CHECKOUT');
+  // v1.3.1: persist the checkout BEFORE navigating — the setTimeout
+  // that used to follow this line died with the page unload, and the
+  // cart page boots with a fresh BOT (BOT.found is null there), so the
+  // pending flag is the only way the walk resumes on the cart page
+  // (live bug 2026-11-21: the bot sat idle on the cart page).
+  saveCheckoutPending({ source: 'api_add_to_cart', product: found.ship.name, skuId: found.sku.id, maxPrice: found.ship.maxPrice, at: Date.now() });
   window.location.href = RSI_ORIGIN + '/store/pledge/cart';
-  // After the cart page loads, the bot (still running, same tab) continues:
-  // it clicks through checkout steps with NextStepMutation, but STOPS at
-  // the payment step unless autoPay is ON. See checkoutStepHandler below.
-  setTimeout(checkoutStepHandler, 4000);
 }
 
 /* --- v1.3.0 express-checkout walk (browser only) --- */
@@ -1207,6 +1350,9 @@ async function addToCartAndCheckout(found) {
 /** Log a stopped walk: why it stopped, and that later steps will NOT run. */
 function expressWalkFail(reason, msg) {
   BOT.expressWalk = 'stopped';
+  // v1.3.1: a stopped walk is no longer pending — clear the flag so a
+  // later cart/express page load does not resume it by surprise.
+  clearCheckoutPending();
   setStatus('CHECKOUT');
   log('Express checkout STOPPED: ' + msg + ' — later steps will NOT run. Finish the order yourself, or turn Auto-Pay ON and reload the page to try again.');
   notify('Express checkout stopped', msg);
@@ -1235,6 +1381,7 @@ async function runExpressCheckoutWalk() {
   // Gate: Auto-Pay OFF means zero checkout clicks.
   if (!BOT.config.autoPay) {
     BOT.expressWalk = 'stopped';
+    clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
     setStatus('CHECKOUT');
     log('STOPPED at express checkout — Auto-Pay is OFF. The bot will NOT click "Jump to bottom", the Terms checkbox or "Place order". Turn Auto-Pay ON in the panel to let the bot place the order, or finish it yourself.');
     notify('Express checkout — Auto-Pay is OFF', 'The bot stopped at the checkout page. Pay yourself, or turn Auto-Pay ON.');
@@ -1252,6 +1399,7 @@ async function runExpressCheckoutWalk() {
   let cardField = needsPaymentDetails(document);
   if (cardField) {
     BOT.expressWalk = 'stopped';
+    clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
     setStatus('CHECKOUT');
     log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Add a saved payment method on RSI first, or finish the order yourself.');
     notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
@@ -1295,6 +1443,7 @@ async function runExpressCheckoutWalk() {
   cardField = needsPaymentDetails(document);
   if (cardField) {
     BOT.expressWalk = 'stopped';
+    clearCheckoutPending(); // v1.3.1: a stopped walk is no longer pending
     setStatus('CHECKOUT');
     log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Finish the order yourself.');
     notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
@@ -1310,7 +1459,25 @@ async function runExpressCheckoutWalk() {
   notify('Place order clicked!', 'Check the RSI order confirmation to make sure the order went through.');
   setStatus('DONE');
   BOT.expressWalk = 'done';
+  clearCheckoutPending(); // v1.3.1: the checkout finished — no longer pending
   return { ok: true, reason: 'placed' };
+}
+
+/* --- v1.3.1: resume a checkout after a page navigation ---
+ * The cart page boots with a fresh BOT, so it cannot know a checkout
+ * is in progress from memory — it reads the pending flag saved before
+ * the navigation instead. Returns true when a resume was scheduled.
+ * A cart page WITHOUT the flag starts NO walk: a cart the user opened
+ * themselves is left alone. A stale flag (older than 30 minutes) is
+ * ignored and cleared. The express page keeps its own v1.3.0 boot
+ * trigger and does not go through here. */
+function maybeResumeCheckout(delayMs) {
+  if (!isCartPage(window.location.pathname)) return false;
+  const pending = loadCheckoutPending();
+  if (!checkoutPendingValid(pending)) return false;
+  log('Resuming the checkout walk on the cart page — a checkout is pending from the ' + (pending.source === 'api_add_to_cart' ? 'add-to-cart' : 'Buy Now') + ' step (' + pending.product + ').');
+  setTimeout(checkoutStepHandler, (delayMs === undefined ? 3000 : delayMs));
+  return true;
 }
 
 async function checkoutStepHandler() {
@@ -1318,13 +1485,14 @@ async function checkoutStepHandler() {
   // -> Terms -> Place order), gated on Auto-Pay — it does not use the
   // cart's moveNext steps.
   if (isExpressCheckoutPage(window.location.pathname)) { await runExpressCheckoutWalk(); return; }
-  if (!/\/store\/pledge\/cart/.test(window.location.pathname)) return;
+  if (!isCartPage(window.location.pathname)) return;
   const blocker = detectBlocker(document);
   if (blocker) { pauseBot('Checkout shows a ' + blocker + ' screen.'); return; }
   const payText = (document.body.innerText || '').toLowerCase();
   const onPaymentStep = /payment method|select.*payment|place order|pay now/.test(payText);
   if (onPaymentStep && !BOT.config.autoPay) {
     setStatus('CHECKOUT');
+    clearCheckoutPending(); // v1.3.1: the walk stopped here with a clear reason — no longer pending
     log('STOPPED at the payment step — Auto-Pay is OFF. Pay yourself now, the ship is in your cart.');
     notify('Ship in your cart — pay now!', 'Auto-Pay is OFF. Complete the payment yourself before stock runs out.');
     return;
@@ -1336,9 +1504,11 @@ async function checkoutStepHandler() {
       log('Clicking the Place Order button once with random human-like mouse movement (saved payment must already be selected).');
       await humanClick(btn);
       setStatus('DONE');
+      clearCheckoutPending(); // v1.3.1: the checkout finished — no longer pending
     } else {
       log('Auto-Pay is ON but no enabled Place Order button was found — pay yourself.');
       notify('Pay manually', 'No Place Order button found. Complete the payment yourself.');
+      clearCheckoutPending(); // v1.3.1: the walk stopped here with a clear reason — no longer pending
     }
     return;
   }
@@ -1613,10 +1783,12 @@ function buildPanel() {
     });
   }
 
-  // If we landed on the cart after an add-to-cart, resume the checkout walk.
-  if (/\/store\/pledge\/cart/.test(window.location.pathname) && BOT.found) {
-    setTimeout(checkoutStepHandler, 3000);
-  }
+  // v1.3.1: if we landed on the cart after a Buy Now / add-to-cart,
+  // resume the checkout walk from the pending flag saved before the
+  // navigation. The old check used BOT.found, which is always null on
+  // a fresh page load — so the walk never resumed (live bug
+  // 2026-11-21). Without the flag the bot starts NO walk here.
+  maybeResumeCheckout();
   // v1.3.0: if we landed on the express checkout page, walk it
   // (Jump to bottom -> Terms -> Place order). The walk itself is gated
   // on Auto-Pay: with Auto-Pay OFF it clicks nothing and stops.
@@ -1652,6 +1824,9 @@ if (typeof module !== 'undefined' && module.exports) {
     isExpressCheckoutPage, findJumpToBottomButton, findTermsCheckbox,
     findPlaceOrderButton, termsClickTarget, needsPaymentDetails,
     runExpressCheckoutWalk,
+    isCartPage, maybeResumeCheckout, saveCheckoutPending, loadCheckoutPending,
+    clearCheckoutPending, checkoutPendingValid, clickBuyNowIfAvailable,
+    clickReacted, waitForClickReaction,
     clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
     startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
   };

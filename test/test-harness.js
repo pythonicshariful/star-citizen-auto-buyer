@@ -235,7 +235,14 @@ check('humanPath is curved, not a straight line', (() => {
 check('Buy Now selectors include the pasted button', bot.BUY_NOW_SELECTORS.includes('[data-testid="express-buy-now"]') && bot.BUY_NOW_SELECTORS.includes('.a-buyNowButton') && bot.BUY_NOW_SELECTORS.includes('button[aria-label="Buy Now"]') && bot.BUY_NOW_SELECTORS.includes('.m-storeAction__buyNow'));
 check('script defines humanClick + humanMoveTo + findBuyNowButton', SRC.includes('async function humanClick') && SRC.includes('async function humanMoveTo') && SRC.includes('function findBuyNowButton'));
 check('humanClick dispatches mousemove / mousedown / mouseup / click with random delays', SRC.includes("'mousemove'") && SRC.includes("'mousedown'") && SRC.includes("'mouseup'") && SRC.includes("'click'") && SRC.includes('randInt(8, 30)') && SRC.includes('randInt(80, 350)'));
-check('Place Order uses humanClick, not instant btn.click()', !/btn\.click\s*\(\)/.test(SRC) && SRC.includes('await humanClick(btn)'));
+// v1.3.1: the plain .click() fallback exists ONLY in the Buy Now path
+// (after the human-like click got no reaction from the page). The
+// Place Order paths — checkoutStepHandler and the express walk — must
+// still use humanClick only, never a plain click.
+const checkoutFnSrc = (SRC.match(/async function checkoutStepHandler[\s\S]*?\n}/) || [''])[0];
+const walkFnSrc = (SRC.match(/async function runExpressCheckoutWalk[\s\S]*?\n}/) || [''])[0];
+check('Place Order uses humanClick, not instant btn.click()',
+  checkoutFnSrc.includes('await humanClick(btn)') && !/\.click\s*\(\)/.test(checkoutFnSrc) && !/\.click\s*\(\)/.test(walkFnSrc));
 check('loop checks DOM Buy Now before API (fallback if API lags)', SRC.includes('clickBuyNowIfAvailable()'));
 
 console.log('== 10. Start Monitor -> Buy Now path (v1.1.2) ==');
@@ -534,6 +541,12 @@ function makeFakeDocument() {
     addEventListener: function (t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
     dispatchEvent: function (ev) { this._events.push(ev); (this._listeners[ev.type] || []).slice().forEach((f) => f(ev)); return true; },
     elementFromPoint: function () { return null; },
+    contains: function (el) {
+      let found = false;
+      const walk = (node) => { for (const c of node.children || []) { if (c === el) found = true; walk(c); } };
+      walk(body);
+      return found;
+    },
   };
 }
 function makeFakeWindow() {
@@ -1024,6 +1037,245 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('(e) card details needed: zero clicks', envE.order.length === 0, envE.order.join(','));
   check('(e) card details needed: log says the bot NEVER types card details',
     envE.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
+
+  console.log('== 17. Cart-page resume + click verification (v1.3.1) ==');
+  // REGRESSION (live 2026-11-21, First Flight Pack, v1.3.0, Auto-Pay ON):
+  // "Buy Now clicked (human-like path)" at 17:15:52, then NOTHING — the
+  // panel log ran on the SAME product page until 17:22:25, no checkout
+  // walk ever started. Two causes: (1) the cart page boots with a fresh
+  // BOT (BOT.found is null there) and the panel only resumed the walk
+  // "if (.../cart... && BOT.found)", so it never resumed — same for the
+  // API path, whose setTimeout(checkoutStepHandler, 4000) died with the
+  // page unload; (2) "Buy Now clicked" only meant the synthetic events
+  // dispatched — the page never reacted.
+  // Tampermonkey storage for the §17 envs (shared across loaders, like
+  // a real GM store surviving a page navigation).
+  const gmStore = {};
+  global.GM_getValue = function (k, d) { return (k in gmStore) ? gmStore[k] : (d === undefined ? null : d); };
+  global.GM_setValue = function (k, v) { gmStore[k] = v; };
+  const PENDING_KEY = 'scab_checkout_pending';
+  function setPending(p) { gmStore[PENDING_KEY] = JSON.stringify(p); }
+  function clearPending() { delete gmStore[PENDING_KEY]; }
+
+  // --- pure: page matching + flag storage (first loader, memory fallback) ---
+  check('isCartPage: the cart URL is a cart page',
+    bot.isCartPage('https://robertsspaceindustries.com/en/store/pledge/cart') === true);
+  check('isCartPage: express / product pages are not',
+    bot.isCartPage(EXPRESS_URL) === false && bot.isCartPage(KRAKEN.url) === false && bot.isCartPage('') === false);
+  check('pending flag round-trips (save -> load)',
+    (() => { bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() }); const p = bot.loadCheckoutPending(); return p && p.source === 'dom_buy_now' && p.product === 'First Flight Pack' && p.maxPrice === 100; })());
+  check('pending flag clears (clear -> load null)',
+    (() => { bot.clearCheckoutPending(); return bot.loadCheckoutPending() === null; })());
+  check('stale flag (31 min old) is invalid and cleared',
+    (() => { bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'X', at: Date.now() - 31 * 60 * 1000 }); const ok = bot.checkoutPendingValid(bot.loadCheckoutPending()) === false; return ok && bot.loadCheckoutPending() === null; })());
+  check('fresh flag is valid',
+    (() => { bot.saveCheckoutPending({ source: 'api_add_to_cart', product: 'Kraken', skuId: '1', at: Date.now() }); const ok = bot.checkoutPendingValid(bot.loadCheckoutPending()) === true; bot.clearCheckoutPending(); return ok; })());
+  check('clickReacted: same href + enabled + present -> false',
+    bot.clickReacted('https://robertsspaceindustries.com/en/pledge/x', { disabled: false }) === false);
+  check('clickReacted: disabled button -> true',
+    bot.clickReacted('https://robertsspaceindustries.com/en/pledge/x', { disabled: true }) === true);
+
+  // --- static: wiring ---
+  const domSave = SRC.indexOf("saveCheckoutPending({ source: 'dom_buy_now'");
+  check('DOM path saves the pending flag before navigating to the cart',
+    domSave !== -1 && SRC.indexOf("window.location.href = RSI_ORIGIN + '/store/pledge/cart'", domSave) !== -1);
+  const apiSave = SRC.indexOf("saveCheckoutPending({ source: 'api_add_to_cart'");
+  check('API path saves the pending flag before navigating to the cart',
+    apiSave !== -1 && SRC.indexOf("window.location.href = RSI_ORIGIN + '/store/pledge/cart'", apiSave) !== -1);
+  const atcSrc = (SRC.match(/async function addToCartAndCheckout[\s\S]*?\n}/) || [''])[0];
+  check('the dead setTimeout after navigation is gone from add-to-cart',
+    atcSrc.length > 0 && atcSrc.indexOf('setTimeout(checkoutStepHandler') === -1);
+  const bpSrc = (SRC.match(/function buildPanel[\s\S]*?\n}/) || [''])[0];
+  check('panel boot resumes from the pending flag, not BOT.found',
+    bpSrc.indexOf('maybeResumeCheckout()') !== -1 && bpSrc.indexOf('BOT.found)') === -1);
+  check('maybeResumeCheckout requires the cart page + a valid flag',
+    SRC.includes('if (!isCartPage(window.location.pathname)) return false') && SRC.includes('checkoutPendingValid(pending)'));
+  const slSrc = (SRC.match(/function stopLoop[\s\S]*?\n}/) || [''])[0];
+  check('Stop clears the pending flag', slSrc.indexOf('clearCheckoutPending()') !== -1);
+  const ewfSrc2 = (SRC.match(/function expressWalkFail[\s\S]*?\n}/) || [''])[0];
+  check('express walk clears the flag when it stops', ewfSrc2.indexOf('clearCheckoutPending()') !== -1);
+  const walkFnSrc2 = (SRC.match(/async function runExpressCheckoutWalk[\s\S]*?\n}/) || [''])[0];
+  check('express walk clears the flag when it finishes (placed)',
+    walkFnSrc2.indexOf('clearCheckoutPending()') !== -1 && walkFnSrc2.indexOf("reason: 'placed'") !== -1);
+  const cshSrc = (SRC.match(/async function checkoutStepHandler[\s\S]*?\n}/) || [''])[0];
+  check('cart walk clears the flag when it stops at payment / finishes',
+    cshSrc.indexOf('clearCheckoutPending()') !== -1);
+  check('click verification: the Buy Now path waits for a reaction and retries once with a plain click',
+    SRC.includes('waitForClickReaction(beforeHref, btn, 2000)') && SRC.includes('retrying once with a plain click') && SRC.includes('did NOT move the page even after a plain click retry'));
+  check('click verification: no cart navigation when the click did not move the page',
+    SRC.includes('NOT navigating to the cart; will retry on the next tick'));
+  check('the bot does not force the cart navigation when RSI is already navigating',
+    SRC.includes('if (!clicked.alreadyNavigating) window.location.href'));
+  check('script exports the new helpers',
+    ['isCartPage', 'maybeResumeCheckout', 'saveCheckoutPending', 'loadCheckoutPending', 'clearCheckoutPending', 'checkoutPendingValid', 'clickBuyNowIfAvailable', 'clickReacted', 'waitForClickReaction'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
+
+  // --- behavioral: Buy Now click verification on a fake product page ---
+  function makeBuyNowEnv(o) {
+    o = o || {};
+    const win = makeFakeWindow();
+    win.location.href = FFP_URL;
+    win.location.pathname = '/en/pledge/Packages/Star-Citizen-First-Flight-Pack';
+    const doc = makeFakeDocument();
+    doc.body.innerText = '';
+    const btn = FakeEl('button');
+    btn.setAttribute('data-testid', 'express-buy-now');
+    btn.offsetParent = {};
+    btn._rect = { left: 100, top: 1500, width: 200, height: 50, right: 300, bottom: 1550 };
+    btn.scrollCalls = [];
+    btn.scrollIntoView = function (opts) {
+      this.scrollCalls.push(opts);
+      win.scrollY = 1200;
+      this._rect = { left: 100, top: 300, width: 200, height: 50, right: 300, bottom: 350 };
+    };
+    btn.getBoundingClientRect = function () { return this._rect; };
+    let clicks = 0;
+    btn.addEventListener('click', () => {
+      clicks++;
+      if (o.reacts === 'navigate') {
+        win.location.href = EXPRESS_URL;
+        win.location.pathname = '/en/store/pledge/express-checkout';
+      } else if (o.reacts === 'disable') {
+        btn.disabled = true;
+      } else if (o.reacts === 'plain-only') {
+        if (clicks >= 2) { win.location.href = EXPRESS_URL; win.location.pathname = '/en/store/pledge/express-checkout'; }
+      } else if (o.reacts === 'remove') {
+        doc.body.children = doc.body.children.filter((c) => c !== btn);
+      }
+      // 'ignore': nothing happens — the page does not react.
+    });
+    doc.body.appendChild(btn);
+    doc.elementFromPoint = function (x, y) {
+      const r = btn._rect;
+      return (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) ? btn : null;
+    };
+    const loaderN = new Function('module', 'exports', 'window', 'document', SRC);
+    const moduleObjN = { exports: {} };
+    loaderN(moduleObjN, moduleObjN.exports, win, doc);
+    const env = { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); }, btn: btn, clicks: function () { return clicks; } };
+    // Add First Flight Pack to the watchlist via the panel form.
+    env.$('scab-add-url').value = FFP_URL;
+    env.$('scab-add-price').value = '60';
+    env.$('scab-add-btn').click();
+    return env;
+  }
+  function clickCount(env) { return env.btn._events.filter((e) => e.type === 'click').length; }
+
+  // (f) The click works: the page navigates (RSI express flow).
+  const envF = makeBuyNowEnv({ reacts: 'navigate' });
+  const resF = await envF.bot.clickBuyNowIfAvailable();
+  check('(f) reacting page: click returns the entry', !!resF && resF.entry && resF.entry.name === 'Star Citizen First Flight Pack', JSON.stringify(resF && resF.entry && resF.entry.name));
+  check('(f) reacting page: already navigating is true', !!resF && resF.alreadyNavigating === true);
+  check('(f) reacting page: exactly one click dispatched (no plain retry)', clickCount(envF) === 1, 'clicks=' + clickCount(envF));
+  check('(f) reacting page: log says the page reacted', envF.$('scab-log')._html.indexOf('the page reacted') !== -1);
+
+  // (g) The page ignores the human-like click, reacts to the plain retry.
+  const envG = makeBuyNowEnv({ reacts: 'plain-only' });
+  const resG = await envG.bot.clickBuyNowIfAvailable();
+  check('(g) plain-only page: click returns the entry after the retry', !!resG && !!resG.entry, JSON.stringify(resG));
+  check('(g) plain-only page: the retry was logged', envG.$('scab-log')._html.indexOf('retrying once with a plain click') !== -1);
+  check('(g) plain-only page: two clicks were dispatched (human-like + one plain retry)', clickCount(envG) === 2, 'clicks=' + clickCount(envG));
+
+  // (h) The page ignores everything: no entry, no cart navigation, plainly logged.
+  const envH = makeBuyNowEnv({ reacts: 'ignore' });
+  const resH = await envH.bot.clickBuyNowIfAvailable();
+  check('(h) ignoring page: click returns false', resH === false, JSON.stringify(resH));
+  check('(h) ignoring page: log says the click did NOT move the page', envH.$('scab-log')._html.indexOf('did NOT move the page') !== -1);
+  check('(h) ignoring page: log says it is NOT navigating to the cart', envH.$('scab-log')._html.indexOf('NOT navigating to the cart') !== -1);
+  check('(h) ignoring page: the page URL did not change', envH.win.location.href === FFP_URL, envH.win.location.href);
+
+  // (i) The button disappears after the click (RSI removed it): counts as a reaction.
+  const envI = makeBuyNowEnv({ reacts: 'remove' });
+  const resI = await envI.bot.clickBuyNowIfAvailable();
+  check('(i) removed button: click returns the entry', !!resI && !!resI.entry, JSON.stringify(resI));
+  check('(i) removed button: no plain retry was needed', clickCount(envI) === 1, 'clicks=' + clickCount(envI));
+
+  // (o) End-to-end DOM path via Start: click -> page navigates -> flag saved, RSI navigation NOT overridden.
+  const envO = makeBuyNowEnv({ reacts: 'navigate' });
+  clearPending();
+  envO.$('scab-start').click();
+  await sleepMs(3000);
+  const flagO = envO.bot.loadCheckoutPending();
+  check('(o) DOM path via Start: pending flag saved with source dom_buy_now',
+    !!flagO && flagO.source === 'dom_buy_now' && flagO.product === 'Star Citizen First Flight Pack', JSON.stringify(flagO));
+  check('(o) DOM path via Start: RSI navigation to express checkout was NOT overridden with the cart',
+    envO.win.location.href === EXPRESS_URL, envO.win.location.href);
+  clearPending();
+
+  // (p) End-to-end API path via Start: in-stock Kraken -> add-to-cart -> flag saved, cart navigation.
+  const envP = (function () {
+    const win = makeFakeWindow(); // default location is the Kraken page
+    const doc = makeFakeDocument();
+    doc.body.innerText = '';
+    const loaderN = new Function('module', 'exports', 'window', 'document', SRC);
+    const moduleObjN = { exports: {} };
+    loaderN(moduleObjN, moduleObjN.exports, win, doc);
+    return { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); } };
+  })();
+  const realFetch2 = global.fetch;
+  global.fetch = async () => ({ status: 200, ok: true, json: async () => loadFixture('kraken-in-stock-synthetic.json') });
+  clearPending();
+  envP.$('scab-start').click();
+  await sleepMs(1500);
+  const flagP = envP.bot.loadCheckoutPending();
+  check('(p) API path via Start: pending flag saved with source api_add_to_cart',
+    !!flagP && flagP.source === 'api_add_to_cart' && flagP.product === 'Kraken' && !!flagP.skuId, JSON.stringify(flagP));
+  check('(p) API path via Start: bot navigated to the cart',
+    envP.win.location.href === 'https://robertsspaceindustries.com/store/pledge/cart', envP.win.location.href);
+  global.fetch = realFetch2;
+  clearPending();
+
+  // --- behavioral: cart-page resume ---
+  function makeCartEnv(o) {
+    o = o || {};
+    const win = makeFakeWindow();
+    win.location.href = 'https://robertsspaceindustries.com/en/store/pledge/cart';
+    win.location.pathname = '/en/store/pledge/cart';
+    const doc = makeFakeDocument();
+    doc.body.innerText = o.bodyText || '';
+    const loaderN = new Function('module', 'exports', 'window', 'document', SRC);
+    const moduleObjN = { exports: {} };
+    loaderN(moduleObjN, moduleObjN.exports, win, doc);
+    return { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); } };
+  }
+  // (j) Flag set: the cart page resumes the walk (boot schedules it).
+  setPending({ source: 'dom_buy_now', product: 'First Flight Pack', maxPrice: 100, at: Date.now() });
+  const realFetch3 = global.fetch;
+  global.fetch = async () => ({ status: 200, ok: true, json: async () => ({}) });
+  const envJ = makeCartEnv();
+  await sleepMs(3800);
+  check('(j) cart page WITH flag: the walk resumed', envJ.$('scab-log')._html.indexOf('Resuming the checkout walk on the cart page') !== -1);
+  check('(j) cart page WITH flag: a checkout step ran', envJ.$('scab-log')._html.indexOf('Advanced one checkout step.') !== -1);
+  check('(j) cart page WITH flag: the flag stays while the walk is in progress',
+    !!envJ.bot.loadCheckoutPending(), JSON.stringify(envJ.bot.loadCheckoutPending()));
+  global.fetch = realFetch3;
+  clearPending();
+  // (k) No flag: the cart page starts NO walk.
+  const envK = makeCartEnv();
+  check('(k) cart page WITHOUT flag: maybeResumeCheckout refuses', envK.bot.maybeResumeCheckout(50) === false);
+  await sleepMs(300);
+  check('(k) cart page WITHOUT flag: no checkout step ran',
+    envK.$('scab-log')._html.indexOf('Advanced one checkout step.') === -1 &&
+    envK.$('scab-log')._html.indexOf('Resuming the checkout walk') === -1);
+  // (l) Stale flag: refused and cleared.
+  setPending({ source: 'dom_buy_now', product: 'Kraken', at: Date.now() - 31 * 60 * 1000 });
+  const envL = makeCartEnv();
+  check('(l) stale flag: maybeResumeCheckout refuses', envL.bot.maybeResumeCheckout(50) === false);
+  check('(l) stale flag: the stale flag is cleared', envL.bot.loadCheckoutPending() === null);
+  clearPending();
+  // (m) Walk stopped (Auto-Pay OFF): the flag is cleared.
+  const envM = makeExpressEnv();
+  envM.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'First Flight Pack', at: Date.now() });
+  const resM = await envM.bot.runExpressCheckoutWalk(); // Auto-Pay OFF by default
+  check('(m) walk stopped (Auto-Pay OFF): flag is cleared',
+    resM.reason === 'autopay_off' && envM.bot.loadCheckoutPending() === null, JSON.stringify(resM));
+  // (n) Stop press clears the flag.
+  const envN = makeBuyNowEnv({ reacts: 'ignore' });
+  envN.bot.saveCheckoutPending({ source: 'dom_buy_now', product: 'X', at: Date.now() });
+  envN.$('scab-stop').click();
+  check('(n) Stop press clears the pending flag', envN.bot.loadCheckoutPending() === null);
+
+  delete global.GM_getValue;
+  delete global.GM_setValue;
 
   delete global.MouseEvent;
 })().then(() => {
