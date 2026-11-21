@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.2.2
+// @version      1.3.0
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,26 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.2.2
+ * Star Citizen Auto Buyer — v1.3.0
  * =================================
+ * v1.3.0 (2026-11-21): express-checkout walk. When the page is the
+ *   express checkout page (.../store/pledge/express-checkout) the bot
+ *   now walks the final three steps in order, ONLY when Auto-Pay is
+ *   ON in the panel (Auto-Pay stays OFF by default): (1) click the
+ *   "Jump to bottom" button — matched by its TEXT, never by class or
+ *   data-cy-id alone (other buttons share those); (2) check the Terms
+ *   of Service box — matched by data-testid="express-terms-checkbox",
+ *   NEVER by its id (React generates a new id on every render), clicked
+ *   via its label so the React handler fires, and verified checked
+ *   afterwards; (3) click "Place order" — matched by
+ *   data-testid="express-card-form-submit". Each step re-finds its
+ *   element after a short settle wait and checks it is visible and
+ *   clickable before the human-like click; if any step fails the walk
+ *   STOPS right there and later steps are never attempted. When
+ *   Auto-Pay is OFF the bot clicks NONE of the three — it stops at
+ *   the checkout page with an alarm, exactly as before. The bot NEVER
+ *   types card details or CVV: if the page shows a payment form that
+ *   needs card details, the walk stops and alarms instead.
  * v1.2.2 FIX (2026-11-21): the Buy Now click itself threw on the real
  *   RSI page, so the button was found, the price guard passed — and
  *   still nothing was clicked. The live error was:
@@ -650,6 +668,7 @@ const BOT = {
   logLines: [],
   found: null, // { ship, sku } once stock is found
   mouse: null, // last known mouse position {x, y} for human-like paths
+  expressWalk: 'idle', // v1.3.0: idle | running | done | stopped (express-checkout walk state, one run per page load)
 };
 
 function log(msg) {
@@ -905,6 +924,121 @@ function findBuyNowButton(doc) {
   return null;
 }
 
+/* --- v1.3.0 express-checkout helpers (pure, unit-tested) --- */
+
+/** True when the URL is RSI's express checkout page (.../store/pledge/express-checkout). */
+function isExpressCheckoutPage(url) {
+  const u = String(url || '').toLowerCase();
+  if (!u) return false;
+  return u.indexOf('express-checkout') !== -1;
+}
+
+/**
+ * Find the "Jump to bottom" button on the express checkout page.
+ * Matched by its TEXT, not by class or data-cy-id alone — other
+ * buttons on the page share those (class "a-button ... -fullWidth",
+ * data-cy-id="button"). Exact text match first, then a contains match.
+ */
+function findJumpToBottomButton(doc) {
+  const d = doc || document;
+  const btns = d.querySelectorAll ? d.querySelectorAll('button') : [];
+  for (const b of btns) {
+    const t = (b.textContent || '').trim().toLowerCase();
+    if (t === 'jump to bottom' && isClickableEl(b)) return b;
+  }
+  for (const b of btns) {
+    const t = (b.textContent || '').trim().toLowerCase();
+    if (t.indexOf('jump to bottom') !== -1 && isClickableEl(b)) return b;
+  }
+  return null;
+}
+
+/**
+ * Find the Terms of Service checkbox on the express checkout page.
+ * Matched ONLY by data-testid="express-terms-checkbox". NEVER by its
+ * id — React generates a new id (":r...:") on every render, so an id
+ * selector would break on the next page load.
+ */
+function findTermsCheckbox(doc) {
+  const d = doc || document;
+  if (!d.querySelector) return null;
+  try {
+    const el = d.querySelector('[data-testid="express-terms-checkbox"]');
+    return el || null;
+  } catch (e) { return null; }
+}
+
+/**
+ * Find the "Place order" button on the express checkout page.
+ * Matched by data-testid="express-card-form-submit", and only returned
+ * when it is visible and clickable.
+ */
+function findPlaceOrderButton(doc) {
+  const d = doc || document;
+  if (!d.querySelector) return null;
+  let el = null;
+  try { el = d.querySelector('[data-testid="express-card-form-submit"]'); } catch (e) { return null; }
+  if (!el || !isClickableEl(el)) return null;
+  return el;
+}
+
+/**
+ * What to click to check the Terms box: the <label> wrapping the
+ * checkbox if there is one (clicking a label fires the React handler
+ * on the input), else the checkbox's display wrapper, else the input
+ * itself. The input is often visually hidden (0-size), so clicking it
+ * directly is the last resort, not the first.
+ */
+function termsClickTarget(input) {
+  if (!input) return null;
+  try {
+    if (typeof input.closest === 'function') {
+      const label = input.closest('label');
+      if (label) return label;
+    }
+  } catch (e) { /* fall through to the parent walk */ }
+  let n = input.parentNode || input.parentElement || null;
+  while (n) {
+    const tag = (n.tagName || '').toUpperCase();
+    const cls = (n.className && typeof n.className === 'string') ? n.className : '';
+    if (tag === 'LABEL') return n;
+    if (/\ba-checkboxDisplay\b/.test(cls) || /\ba-checkbox__inside\b/.test(cls)) return n;
+    n = n.parentNode || n.parentElement || null;
+  }
+  return input;
+}
+
+/**
+ * Does this checkout page show a payment form that still needs card
+ * details typed in? Returns the first visible, EMPTY card field found
+ * (card number / CVV / CVC / expiry), or null. A field that already
+ * has a value (a saved card) does NOT count. The bot NEVER types card
+ * details — when this returns a field, the checkout walk stops.
+ */
+function needsPaymentDetails(doc) {
+  const d = doc || document;
+  if (!d.querySelectorAll) return null;
+  let inputs = [];
+  try { inputs = d.querySelectorAll('input'); } catch (e) { return null; }
+  for (const el of inputs) {
+    if (!el) continue;
+    const type = String((el.type || '')).toLowerCase();
+    if (type === 'hidden' || type === 'checkbox' || type === 'radio' || type === 'submit' || type === 'button') continue;
+    if (!isClickableEl(el)) continue; // hidden / 0-size fields are not a form asking for input
+    const val = String(el.value === undefined || el.value === null ? '' : el.value).trim();
+    if (val !== '') continue; // already filled (e.g. a saved card) — not asking for details
+    let ac = '';
+    try { ac = String(el.getAttribute ? el.getAttribute('autocomplete') || '' : '').toLowerCase(); } catch (e) {}
+    if (ac === 'cc-number' || ac === 'cc-csc' || ac === 'cc-exp' || ac === 'cc-exp-month' || ac === 'cc-exp-year') return el;
+    let hay = '';
+    try {
+      hay = [el.getAttribute ? el.getAttribute('name') : '', el.getAttribute ? el.getAttribute('id') : '', el.getAttribute ? el.getAttribute('placeholder') : ''].join(' ').toLowerCase();
+    } catch (e) { hay = ''; }
+    if (/card.?number|cvv|cvc|expir|card.?holder|card.?name/.test(hay)) return el;
+  }
+  return null;
+}
+
 /** If a Buy Now button is available on a watched product's page, click it human-like. */
 async function clickBuyNowIfAvailable() {
   if (!BOT.config.humanClick) return false;
@@ -1068,7 +1202,122 @@ async function addToCartAndCheckout(found) {
   setTimeout(checkoutStepHandler, 4000);
 }
 
+/* --- v1.3.0 express-checkout walk (browser only) --- */
+
+/** Log a stopped walk: why it stopped, and that later steps will NOT run. */
+function expressWalkFail(reason, msg) {
+  BOT.expressWalk = 'stopped';
+  setStatus('CHECKOUT');
+  log('Express checkout STOPPED: ' + msg + ' — later steps will NOT run. Finish the order yourself, or turn Auto-Pay ON and reload the page to try again.');
+  notify('Express checkout stopped', msg);
+  return { ok: false, reason: reason };
+}
+
+/**
+ * Walk the express checkout page (.../store/pledge/express-checkout),
+ * in order: (1) "Jump to bottom", (2) Terms of Service checkbox,
+ * (3) "Place order". Each step re-finds its element after a short
+ * settle wait and checks it is visible/clickable before the human-like
+ * click. If any step fails, the walk STOPS there — it never skips ahead
+ * to Place order.
+ *
+ * GATING: runs ONLY when Auto-Pay is ON in the panel. When OFF, it
+ * clicks NOTHING — it stops at the checkout page with an alarm,
+ * exactly as the bot did before v1.3.0.
+ *
+ * The bot NEVER types card details or CVV. If the page shows a payment
+ * form that still needs card details, the walk stops and alarms.
+ */
+async function runExpressCheckoutWalk() {
+  if (BOT.expressWalk === 'running' || BOT.expressWalk === 'done') return { ok: false, reason: 'already_' + BOT.expressWalk };
+  BOT.expressWalk = 'running';
+
+  // Gate: Auto-Pay OFF means zero checkout clicks.
+  if (!BOT.config.autoPay) {
+    BOT.expressWalk = 'stopped';
+    setStatus('CHECKOUT');
+    log('STOPPED at express checkout — Auto-Pay is OFF. The bot will NOT click "Jump to bottom", the Terms checkbox or "Place order". Turn Auto-Pay ON in the panel to let the bot place the order, or finish it yourself.');
+    notify('Express checkout — Auto-Pay is OFF', 'The bot stopped at the checkout page. Pay yourself, or turn Auto-Pay ON.');
+    return { ok: false, reason: 'autopay_off' };
+  }
+
+  const blocker = detectBlocker(document);
+  if (blocker) {
+    BOT.expressWalk = 'stopped';
+    pauseBot('Express checkout shows a ' + blocker + ' screen.');
+    return { ok: false, reason: 'blocker_' + blocker };
+  }
+
+  // The bot never types card details: if the page asks for them, stop.
+  let cardField = needsPaymentDetails(document);
+  if (cardField) {
+    BOT.expressWalk = 'stopped';
+    setStatus('CHECKOUT');
+    log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Add a saved payment method on RSI first, or finish the order yourself.');
+    notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
+    return { ok: false, reason: 'needs_payment_details' };
+  }
+
+  setStatus('CHECKOUT');
+  log('Express checkout (Auto-Pay ON): walking Jump to bottom → Terms → Place order…');
+
+  // Step 1/3 — "Jump to bottom" (matched by its text).
+  await sleep(400);
+  const jumpBtn = findJumpToBottomButton(document);
+  if (!jumpBtn) return expressWalkFail('jump_not_found', 'the "Jump to bottom" button was not found on the express checkout page');
+  log('Express checkout: step 1/3 — clicking "Jump to bottom"…');
+  if (!(await humanClick(jumpBtn))) return expressWalkFail('jump_not_clickable', 'the "Jump to bottom" button could not be clicked (not visible / covered after scrolling)');
+  log('Express checkout: step 1/3 done — jumped to the bottom.');
+  await sleep(700);
+
+  // Step 2/3 — Terms of Service checkbox (matched by data-testid, never by id).
+  const terms = findTermsCheckbox(document);
+  if (!terms) return expressWalkFail('terms_not_found', 'the Terms of Service checkbox was not found on the express checkout page');
+  if (terms.checked) {
+    log('Express checkout: step 2/3 — the Terms checkbox is already checked, skipping the click.');
+  } else {
+    log('Express checkout: step 2/3 — checking the Terms of Service box…');
+    const target = termsClickTarget(terms);
+    if (!target || !(await humanClick(target))) return expressWalkFail('terms_not_clickable', 'the Terms checkbox could not be clicked (label / checkbox not visible / covered)');
+    await sleep(300);
+    if (!terms.checked && target !== terms && isClickableEl(terms)) {
+      // The label click did not check the box — try the input itself once.
+      await humanClick(terms);
+      await sleep(300);
+    }
+    if (!terms.checked) return expressWalkFail('terms_still_unchecked', 'the Terms checkbox is still unchecked after clicking it — NOT placing the order');
+    log('Express checkout: step 2/3 done — Terms of Service checked.');
+  }
+  await sleep(500);
+
+  // Card-details guard again before the final click (the form can
+  // appear only once the page has scrolled to the bottom).
+  cardField = needsPaymentDetails(document);
+  if (cardField) {
+    BOT.expressWalk = 'stopped';
+    setStatus('CHECKOUT');
+    log('Express checkout STOPPED: the page needs card details filled in — the bot NEVER types card details or CVV. Finish the order yourself.');
+    notify('Express checkout needs card details', 'The bot never types card details. Finish the payment yourself.');
+    return { ok: false, reason: 'needs_payment_details' };
+  }
+
+  // Step 3/3 — "Place order" (matched by data-testid).
+  const placeBtn = findPlaceOrderButton(document);
+  if (!placeBtn) return expressWalkFail('place_not_found', 'the "Place order" button was not found on the express checkout page');
+  log('Express checkout: step 3/3 — clicking "Place order"…');
+  if (!(await humanClick(placeBtn))) return expressWalkFail('place_not_clickable', 'the "Place order" button could not be clicked (not visible / covered after scrolling)');
+  log('Express checkout: "Place order" clicked — check the order confirmation yourself. The bot never types card details.');
+  notify('Place order clicked!', 'Check the RSI order confirmation to make sure the order went through.');
+  setStatus('DONE');
+  BOT.expressWalk = 'done';
+  return { ok: true, reason: 'placed' };
+}
+
 async function checkoutStepHandler() {
+  // v1.3.0: the express checkout page has its own walk (Jump to bottom
+  // -> Terms -> Place order), gated on Auto-Pay — it does not use the
+  // cart's moveNext steps.
+  if (isExpressCheckoutPage(window.location.pathname)) { await runExpressCheckoutWalk(); return; }
   if (!/\/store\/pledge\/cart/.test(window.location.pathname)) return;
   const blocker = detectBlocker(document);
   if (blocker) { pauseBot('Checkout shows a ' + blocker + ' screen.'); return; }
@@ -1264,7 +1513,7 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;max-width:calc(100vw - 24px);background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div id="scab-header" title="Drag to move the panel (double-click to reset position and size)" style="display:flex;justify-content:space-between;align-items:center;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;">' +
-    '<b>🚀 SC Auto Buyer v1.2.1</b>' +
+    '<b>🚀 SC Auto Buyer v1.3.0</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
@@ -1283,7 +1532,7 @@ function buildPanel() {
     '<button id="scab-add-btn" style="width:100%;margin-top:6px;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;">Add product</button>' +
     '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
     '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
-    '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order (OFF = bot stops at payment)</label>' +
+    '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order — ON = the bot places the order itself (express checkout too: Jump to bottom → Terms → Place order). OFF = bot stops at payment.</label>' +
     '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
     '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
     '<div id="scab-resize-grip" title="Drag to resize the panel" style="position:absolute;right:2px;bottom:2px;width:18px;height:18px;cursor:nwse-resize;touch-action:none;display:flex;align-items:flex-end;justify-content:flex-end;color:#64748b;font-size:13px;line-height:1;z-index:2;">↘</div>';
@@ -1297,7 +1546,13 @@ function buildPanel() {
   payBox.addEventListener('change', () => {
     BOT.config.autoPay = payBox.checked;
     saveConfig();
-    log('Auto-Pay is now ' + (BOT.config.autoPay ? 'ON — the bot may click Place Order with a saved payment method.' : 'OFF — the bot will stop at the payment step.'));
+    log('Auto-Pay is now ' + (BOT.config.autoPay ? 'ON — the bot may click Place Order with a saved payment method, including the express checkout walk (Jump to bottom → Terms → Place order).' : 'OFF — the bot will stop at the payment step.'));
+    // v1.3.0: if Auto-Pay was just switched ON while sitting on the
+    // express checkout page, run the walk now (it was blocked while OFF).
+    if (BOT.config.autoPay && isExpressCheckoutPage(window.location.href) &&
+        (BOT.expressWalk === 'idle' || BOT.expressWalk === 'stopped')) {
+      setTimeout(runExpressCheckoutWalk, 500);
+    }
   });
   document.getElementById('scab-start').addEventListener('click', startLoop);
   document.getElementById('scab-stop').addEventListener('click', stopLoop);
@@ -1362,6 +1617,12 @@ function buildPanel() {
   if (/\/store\/pledge\/cart/.test(window.location.pathname) && BOT.found) {
     setTimeout(checkoutStepHandler, 3000);
   }
+  // v1.3.0: if we landed on the express checkout page, walk it
+  // (Jump to bottom -> Terms -> Place order). The walk itself is gated
+  // on Auto-Pay: with Auto-Pay OFF it clicks nothing and stops.
+  if (isExpressCheckoutPage(window.location.pathname)) {
+    setTimeout(runExpressCheckoutWalk, 3000);
+  }
   log('Panel ready. Watchlist: ' + BOT.config.watchlist.map((w) => w.name + ' (max $' + w.maxPrice + ')').join(', '));
 }
 
@@ -1388,6 +1649,9 @@ if (typeof module !== 'undefined' && module.exports) {
     pagePriceUsd, domBuyAllowed,
     isRectInViewport, pointHitsElement, scrollIntoViewAndSettle, humanClick,
     makeMouseEvent,
+    isExpressCheckoutPage, findJumpToBottomButton, findTermsCheckbox,
+    findPlaceOrderButton, termsClickTarget, needsPaymentDetails,
+    runExpressCheckoutWalk,
     clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
     startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
   };

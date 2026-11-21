@@ -109,10 +109,16 @@ function fakeEl(o) {
     className: o.cls || '',
     textContent: o.text || '',
     disabled: !!o.disabled,
+    type: o.type || '',
+    value: (o.value !== undefined ? o.value : ''),
     _sitekey: o.sitekey || null,
     _testid: o.testid || null,
     _arialabel: o.arialabel || null,
     _cyid: o.cyid || null,
+    _autocomplete: o.autocomplete || null,
+    _name: o.name || null,
+    _placeholder: o.placeholder || null,
+    _elid: o.elid || null,
     offsetParent: o.hidden ? null : {},
     // A hidden element has a 0-size rect in a real browser.
     _rect: o.hidden ? { width: 0, height: 0 } : (o.rect || { width: 300, height: 65 }),
@@ -123,6 +129,11 @@ function fakeEl(o) {
       if (n === 'data-testid') return this._testid;
       if (n === 'aria-label') return this._arialabel;
       if (n === 'data-cy-id') return this._cyid;
+      if (n === 'autocomplete') return this._autocomplete;
+      if (n === 'name') return this._name;
+      if (n === 'placeholder') return this._placeholder;
+      if (n === 'id') return this._elid;
+      if (n === 'type') return this.type || null;
       return null;
     },
     closest: function (sel) { return (o.inBadge && sel === '.grecaptcha-badge') ? { className: 'grecaptcha-badge' } : null; },
@@ -140,6 +151,10 @@ function fakeDoc(o) {
     if (sel === '.h-captcha') return (el.className || '').split(/\s+/).indexOf('h-captcha') !== -1;
     if (sel === '.cf-turnstile') return (el.className || '').split(/\s+/).indexOf('cf-turnstile') !== -1;
     if (sel === '[data-sitekey]') return !!el._sitekey;
+    // Generic data-testid match (v1.3.0: express-terms-checkbox, express-card-form-submit).
+    var tm = sel.match(/^\[data-testid="([^"]+)"\]$/);
+    if (tm) return el.getAttribute('data-testid') === tm[1];
+    if (sel === 'input') return el.tagName === 'INPUT';
     // Buy Now selectors (v1.1.2 section 10).
     if (sel === '[data-testid="express-buy-now"]') return el.getAttribute('data-testid') === 'express-buy-now';
     if (sel === 'button[aria-label="Buy Now"]') return el.tagName === 'BUTTON' && el.getAttribute('aria-label') === 'Buy Now';
@@ -150,6 +165,10 @@ function fakeDoc(o) {
   }
   return {
     body: { innerText: o.text || '' },
+    querySelector: function (selector) {
+      var all = this.querySelectorAll(selector);
+      return all.length ? all[0] : null;
+    },
     querySelectorAll: function (selector) {
       var parts = String(selector).split(',');
       return els.filter(function (el) { return parts.some(function (p) { return selMatch(el, p); }); });
@@ -318,7 +337,7 @@ check('domBuyAllowed: unknown page price -> allowed (API is the strict cap)', bo
 check('panel has an "Add any product" form', SRC.includes('scab-add-url') && SRC.includes('scab-add-name') && SRC.includes('scab-add-price') && SRC.includes('scab-add-list') && SRC.includes('scab-add-btn'));
 check('panel rows have a Remove button', SRC.includes('data-scab-remove'));
 check('panel explains page-only entries', SRC.includes('page only'));
-check('panel version label is v1.2.1', SRC.includes('SC Auto Buyer v1.2.1'));
+check('panel version label is v1.3.0', SRC.includes('SC Auto Buyer v1.3.0'));
 check('clickBuyNowIfAvailable gates on entryMatchesPage (any watchlisted product)',
   SRC.includes('entryMatchesPage(w, window.location.href)'));
 check('clickBuyNowIfAvailable enforces the max price from the page', SRC.includes('domBuyAllowed(entry, price)'));
@@ -383,6 +402,32 @@ function registerIds(el) {
   if (el.id) fakeDocRegistry[el.id] = el;
   for (const c of el.children) registerIds(c);
 }
+// General fake selector matcher (v1.3.0): tag, .class, [attr], [attr="v"],
+// [attr*="v"] and combinations like button[data-testid="x"] or
+// script[type="application/ld+json"]. Used by the fake browser's
+// querySelector(All) so finders behave like on a real page.
+function fakeSelMatch(el, sel) {
+  sel = sel.trim();
+  if (!sel) return false;
+  if (sel.indexOf(',') !== -1) return sel.split(',').some(function (p) { return fakeSelMatch(el, p); });
+  var m = sel.match(/^([a-zA-Z][\w-]*)?((?:\.[\w-]+)?)((?:\[[^\]]+\])?)$/);
+  if (!m) return false;
+  var tag = m[1] || null, cls = m[2] ? m[2].slice(1) : null, attrPart = m[3] || null;
+  if (tag && el.tagName !== tag.toUpperCase()) return false;
+  if (cls && (el.className || '').split(/\s+/).indexOf(cls) === -1) return false;
+  if (attrPart) {
+    var am = attrPart.match(/^\[([\w-]+)(\*?=)?(?:"([^"]*)")?\]$/);
+    if (!am) return false;
+    var v = null;
+    try { v = (typeof el.getAttribute === 'function') ? el.getAttribute(am[1]) : null; } catch (e) { v = null; }
+    if (v === null || v === undefined) return false;
+    if (!am[2]) return true;
+    if (am[2] === '=') return String(v) === am[3];
+    if (am[2] === '*=') return String(v).indexOf(am[3]) !== -1;
+    return false;
+  }
+  return true;
+}
 function FakeEl(tag, o) {
   o = o || {};
   const el = {
@@ -407,15 +452,26 @@ function FakeEl(tag, o) {
     removeEventListener: function (t, fn) { this._listeners[t] = (this._listeners[t] || []).filter((f) => f !== fn); },
     dispatchEvent: function (ev) { this._events.push(ev); (this._listeners[ev.type] || []).slice().forEach((f) => f(ev)); return true; },
     click: function () { this.dispatchEvent({ type: 'click', target: this, preventDefault: function () {}, stopPropagation: function () {} }); },
-    appendChild: function (c) { this.children.push(c); registerIds(c); return c; },
+    appendChild: function (c) { c.parentNode = this; c.parentElement = this; this.children.push(c); registerIds(c); return c; },
     contains: function (n) { return n === this || this.children.indexOf(n) !== -1; },
-    closest: function () { return null; },
+    closest: function (sel) {
+      var n = this;
+      while (n) {
+        if (sel.charAt(0) === '.') { if ((n.className || '').split(/\s+/).indexOf(sel.slice(1)) !== -1) return n; }
+        else if (n.tagName === sel.toUpperCase()) return n;
+        n = n.parentNode || null;
+      }
+      return null;
+    },
+    querySelector: function (sel) {
+      var all = this.querySelectorAll(sel);
+      return all.length ? all[0] : null;
+    },
     querySelectorAll: function (sel) {
       const out = [];
       const walk = (node) => {
         for (const c of node.children) {
-          if (sel === '[data-scab-remove]' && c._attrs && ('data-scab-remove' in c._attrs)) out.push(c);
-          else if (sel === 'button' && c.tagName === 'BUTTON') out.push(c);
+          if (fakeSelMatch(c, sel)) out.push(c);
           walk(c);
         }
       };
@@ -460,7 +516,21 @@ function makeFakeDocument() {
     _events: [],
     getElementById: function (id) { return fakeDocRegistry[id] || null; },
     createElement: function (tag) { return FakeEl(tag); },
-    querySelectorAll: function () { return []; },
+    querySelector: function (sel) {
+      var all = this.querySelectorAll(sel);
+      return all.length ? all[0] : null;
+    },
+    querySelectorAll: function (sel) {
+      const out = [];
+      const walk = (node) => {
+        for (const c of node.children || []) {
+          if (fakeSelMatch(c, sel)) out.push(c);
+          walk(c);
+        }
+      };
+      walk(body);
+      return out;
+    },
     addEventListener: function (t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
     dispatchEvent: function (ev) { this._events.push(ev); (this._listeners[ev.type] || []).slice().forEach((f) => f(ev)); return true; },
     elementFromPoint: function () { return null; },
@@ -726,6 +796,234 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     !!$3('scab-log') && $3('scab-log')._html.indexOf('Buy Now click FAILED') !== -1 &&
     $3('scab-log')._html.indexOf('will retry on the next tick') !== -1);
   global.MouseEvent = StrictMouseEvent;
+
+  console.log('== 16. Express checkout walk (v1.3.0) ==');
+  // NOTE: `fakeDoc` is shadowed inside this IIFE by section 14's fake
+  // document object, so the pure tests below use this local helper.
+  function docOf(els, text) {
+    return {
+      body: { innerText: text || '' },
+      querySelector: function (sel) { const all = this.querySelectorAll(sel); return all.length ? all[0] : null; },
+      querySelectorAll: function (sel) {
+        return els.filter(function (el) {
+          if (sel === 'button') return el.tagName === 'BUTTON';
+          if (sel === 'input') return el.tagName === 'INPUT';
+          var tm = sel.match(/^\[data-testid="([^"]+)"\]$/);
+          if (tm) return el.getAttribute && el.getAttribute('data-testid') === tm[1];
+          return false;
+        });
+      },
+    };
+  }
+  // --- pure finders (first loader, section 7 fakes) ---
+  var EXPRESS_URL = 'https://robertsspaceindustries.com/en/store/pledge/express-checkout';
+  check('isExpressCheckoutPage: the pasted URL is an express checkout page',
+    bot.isExpressCheckoutPage(EXPRESS_URL) === true);
+  check('isExpressCheckoutPage: cart / product pages are not',
+    bot.isExpressCheckoutPage('https://robertsspaceindustries.com/store/pledge/cart') === false &&
+    bot.isExpressCheckoutPage(KRAKEN.url) === false && bot.isExpressCheckoutPage('') === false);
+  // Step 1 finder: by TEXT, never by class/data-cy-id alone — the other
+  // button on the page shares the same class and data-cy-id.
+  var jumpBtn = fakeEl({ tag: 'button', text: 'Jump to bottom', cls: 'a-button -regular -weak -filled -withShapes -fullWidth', cyid: 'button' });
+  var otherBtn = fakeEl({ tag: 'button', text: 'Add to cart', cls: 'a-button -regular -weak -filled -withShapes -fullWidth', cyid: 'button' });
+  check('findJumpToBottomButton finds the button by its text (other button shares class + data-cy-id)',
+    bot.findJumpToBottomButton(docOf([otherBtn, jumpBtn])) === jumpBtn);
+  check('findJumpToBottomButton ignores a disabled Jump button',
+    bot.findJumpToBottomButton(docOf([fakeEl({ tag: 'button', text: 'Jump to bottom', disabled: true })])) === null);
+  check('findJumpToBottomButton returns null when there is no Jump button',
+    bot.findJumpToBottomButton(docOf([otherBtn])) === null);
+  // Step 2 finder: by data-testid, never by id.
+  var termsInput = fakeEl({ tag: 'input', testid: 'express-terms-checkbox' });
+  termsInput.type = 'checkbox'; termsInput.checked = false;
+  check('findTermsCheckbox finds the checkbox by data-testid',
+    bot.findTermsCheckbox(docOf([termsInput])) === termsInput);
+  check('findTermsCheckbox finds it even with a different React id (the id is never used)',
+    (() => { const t = fakeEl({ tag: 'input', testid: 'express-terms-checkbox', elid: ':r9x:' }); t.type = 'checkbox'; return bot.findTermsCheckbox(docOf([t])) === t; })());
+  check('findTermsCheckbox returns null when the checkbox is absent',
+    bot.findTermsCheckbox(docOf([])) === null);
+  check('the script never selects the checkbox by its React id',
+    !SRC.includes(':r1l:') && !/getElementById\(\s*['"]:r/.test(SRC));
+  // termsClickTarget: label first, display wrapper second, input last.
+  var tLabel = fakeEl({ tag: 'label', cls: 'a-checkbox__inside' });
+  var tInput = fakeEl({ tag: 'input', testid: 'express-terms-checkbox' });
+  tInput.type = 'checkbox'; tInput.parentNode = tLabel;
+  check('termsClickTarget prefers the wrapping label', bot.termsClickTarget(tInput) === tLabel);
+  var tDisp = fakeEl({ tag: 'div', cls: 'a-checkboxDisplay a-checkbox__wrapper -interactive' });
+  var tInput2 = fakeEl({ tag: 'input', testid: 'express-terms-checkbox' });
+  tInput2.type = 'checkbox'; tInput2.parentNode = tDisp;
+  check('termsClickTarget falls back to the checkbox display wrapper', bot.termsClickTarget(tInput2) === tDisp);
+  var tInput3 = fakeEl({ tag: 'input', testid: 'express-terms-checkbox' });
+  tInput3.type = 'checkbox'; tInput3.parentNode = null;
+  check('termsClickTarget falls back to the input itself with no label/wrapper', bot.termsClickTarget(tInput3) === tInput3);
+  // Step 3 finder: by data-testid.
+  var placeBtn = fakeEl({ tag: 'button', text: 'Place order', cls: 'a-button c-expressCardForm__submit -regular -transaction -filled -withShapes -fullWidth', testid: 'express-card-form-submit', cyid: 'button' });
+  check('findPlaceOrderButton finds the button by data-testid',
+    bot.findPlaceOrderButton(docOf([placeBtn])) === placeBtn);
+  check('findPlaceOrderButton ignores a disabled Place order button',
+    bot.findPlaceOrderButton(docOf([fakeEl({ tag: 'button', text: 'Place order', testid: 'express-card-form-submit', disabled: true })])) === null);
+  check('findPlaceOrderButton returns null when absent',
+    bot.findPlaceOrderButton(docOf([])) === null);
+  // Card-details guard.
+  function cardInput(o) {
+    const el = fakeEl(Object.assign({ tag: 'input' }, o || {}));
+    el.type = (o && o.type) || 'text';
+    el.value = (o && o.value) || '';
+    return el;
+  }
+  check('needsPaymentDetails: visible empty card-number field (autocomplete cc-number) is found',
+    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number' })])) !== null);
+  check('needsPaymentDetails: visible empty CVV field (name) is found',
+    bot.needsPaymentDetails(docOf([cardInput({ name: 'cvv' })])) !== null);
+  check('needsPaymentDetails: visible empty expiry field (placeholder) is found',
+    bot.needsPaymentDetails(docOf([cardInput({ placeholder: 'MM / YY expiry' })])) !== null);
+  check('needsPaymentDetails: filled card field (saved card) does NOT count',
+    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number', value: '4111111111111111' })])) === null);
+  check('needsPaymentDetails: hidden card field does NOT count',
+    bot.needsPaymentDetails(docOf([cardInput({ autocomplete: 'cc-number', hidden: true })])) === null);
+  check('needsPaymentDetails: the Terms checkbox itself does NOT count',
+    bot.needsPaymentDetails(docOf([termsInput])) === null);
+  check('needsPaymentDetails: no card fields -> null',
+    bot.needsPaymentDetails(docOf([])) === null);
+  // Static: gating, wiring, exports.
+  check('walk is gated on Auto-Pay (OFF returns before any find/click)',
+    SRC.indexOf('async function runExpressCheckoutWalk') !== -1 &&
+    SRC.indexOf("if (!BOT.config.autoPay)") !== -1 &&
+    SRC.indexOf("if (!BOT.config.autoPay)") < SRC.indexOf('findJumpToBottomButton(document)'));
+  check('panel label says ON places the order itself', SRC.includes('ON = the bot places the order itself'));
+  check('walk checks for card details before Place order (never types them)',
+    SRC.includes('needsPaymentDetails(document)') && SRC.includes('NEVER types card details'));
+  check('checkoutStepHandler hands the express page to the walk',
+    SRC.includes("isExpressCheckoutPage(window.location.pathname)) { await runExpressCheckoutWalk(); return; }"));
+  check('panel boots the express walk on the express checkout page',
+    SRC.includes('if (isExpressCheckoutPage(window.location.pathname))') && SRC.includes('setTimeout(runExpressCheckoutWalk, 3000)'));
+  check('walk re-checks the checkbox state after clicking it',
+    SRC.includes('if (!terms.checked)') && SRC.includes('terms_still_unchecked'));
+  check('walk never skips ahead: failures return via expressWalkFail',
+    SRC.includes('expressWalkFail(') && SRC.includes('later steps will NOT run'));
+  check('script exports the express helpers',
+    ['isExpressCheckoutPage', 'findJumpToBottomButton', 'findTermsCheckbox', 'findPlaceOrderButton', 'termsClickTarget', 'needsPaymentDetails', 'runExpressCheckoutWalk'].every((f) => Object.prototype.hasOwnProperty.call(bot, f)));
+
+  // --- behavioral: the walk end-to-end in a fake express-checkout page ---
+  global.MouseEvent = function (type, init) { this.type = type; if (init) { for (const k in init) this[k] = init[k]; } };
+  function makeExpressEnv(o) {
+    o = o || {};
+    const win = makeFakeWindow();
+    win.location.href = EXPRESS_URL;
+    win.location.pathname = '/en/store/pledge/express-checkout';
+    const doc = makeFakeDocument();
+    doc.body.innerText = '';
+    const order = [];
+    function scrollable(el, rect, settledTop) {
+      el._rect = rect;
+      el.scrollCalls = [];
+      el.scrollIntoView = function (opts) {
+        this.scrollCalls.push(opts);
+        this._rect = { left: rect.left, top: settledTop, width: rect.width, height: rect.height, right: rect.right, bottom: settledTop + rect.height };
+      };
+      el.getBoundingClientRect = function () { return this._rect; };
+      el.offsetParent = {};
+      return el;
+    }
+    // Step 1: "Jump to bottom" — exactly as Shariful pasted it.
+    const jump = scrollable(FakeEl('button', { text: 'Jump to bottom', cls: 'a-button -regular -weak -filled -withShapes -fullWidth', attrs: { 'data-cy-id': 'button' } }),
+      { left: 100, top: 2400, width: 600, height: 50, right: 700, bottom: 2450 }, 100);
+    jump.addEventListener('click', () => order.push('jump'));
+    doc.body.appendChild(jump);
+    // Step 2: Terms checkbox + label — exactly as Shariful pasted it.
+    let tIn = null, tLab = null;
+    if (!o.noTerms) {
+      tLab = scrollable(FakeEl('label', { cls: 'a-checkbox__inside', text: 'I agree to the Terms of Service and Privacy Policy' }),
+        { left: 100, top: 2600, width: 600, height: 40, right: 700, bottom: 2640 }, 300);
+      const disp = FakeEl('div', { cls: 'a-checkboxDisplay a-checkbox__wrapper -interactive' });
+      tIn = FakeEl('input', { attrs: { 'data-testid': 'express-terms-checkbox', 'data-cy-id': 'checkbox__input' } });
+      tIn.type = 'checkbox';
+      tIn.checked = !!o.termsChecked;
+      tLab.appendChild(disp);
+      tLab.appendChild(tIn);
+      // A real browser forwards a label click to its checkbox.
+      tLab.addEventListener('click', () => { tIn.checked = !tIn.checked; });
+      tLab.addEventListener('click', () => order.push('terms'));
+      doc.body.appendChild(tLab);
+    }
+    // Step 3: "Place order" — exactly as Shariful pasted it.
+    const place = scrollable(FakeEl('button', { text: 'Place order', cls: 'a-button c-expressCardForm__submit -regular -transaction -filled -withShapes -fullWidth', attrs: { 'data-testid': 'express-card-form-submit', 'data-cy-id': 'button' } }),
+      { left: 100, top: 2800, width: 600, height: 50, right: 700, bottom: 2850 }, 500);
+    place.addEventListener('click', () => order.push('place'));
+    doc.body.appendChild(place);
+    // Optional: a visible, empty card-number field (payment form asking for details).
+    if (o.cardField) {
+      const card = FakeEl('input', { attrs: { autocomplete: 'cc-number', name: 'cardNumber', placeholder: 'Card number' } });
+      card.type = 'text'; card.value = '';
+      card._rect = { left: 100, top: 200, width: 300, height: 40, right: 400, bottom: 240 };
+      card.offsetParent = {};
+      doc.body.appendChild(card);
+    }
+    const clickables = [jump, tLab, place].filter(Boolean);
+    doc.elementFromPoint = function (x, y) {
+      for (const c of clickables) {
+        const r = c._rect;
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return c;
+      }
+      return null;
+    };
+    const loaderN = new Function('module', 'exports', 'window', 'document', SRC);
+    const moduleObjN = { exports: {} };
+    loaderN(moduleObjN, moduleObjN.exports, win, doc);
+    return { win: win, doc: doc, bot: moduleObjN.exports, $: function (id) { return doc.getElementById(id); }, order: order, jump: jump, termsInput: tIn, place: place };
+  }
+  function setAutoPay(env, on) {
+    const box = env.$('scab-autopay');
+    box.checked = !!on;
+    box.dispatchEvent({ type: 'change', target: box });
+  }
+
+  // (a) Happy path: Auto-Pay ON, all three present, Terms unchecked.
+  const envA = makeExpressEnv();
+  setAutoPay(envA, true);
+  const resA = await envA.bot.runExpressCheckoutWalk();
+  check('(a) happy path: walk succeeds', resA.ok === true && resA.reason === 'placed', JSON.stringify(resA));
+  check('(a) happy path: the three steps ran IN ORDER (jump -> terms -> place)',
+    envA.order.join(',') === 'jump,terms,place', envA.order.join(','));
+  check('(a) happy path: Terms checkbox is checked afterwards', envA.termsInput.checked === true);
+  check('(a) happy path: each step was logged', ['step 1/3', 'step 2/3', 'step 3/3', '"Place order" clicked'].every((s) => envA.$('scab-log')._html.indexOf(s) !== -1));
+  check('(a) happy path: status is DONE', envA.$('scab-status').textContent === 'DONE');
+
+  // (b) Terms already checked: the checkbox click is skipped, Place order still fires.
+  const envB = makeExpressEnv({ termsChecked: true });
+  setAutoPay(envB, true);
+  const resB = await envB.bot.runExpressCheckoutWalk();
+  check('(b) already-checked Terms: walk succeeds', resB.ok === true);
+  check('(b) already-checked Terms: label NOT clicked, Place order still clicked',
+    envB.order.join(',') === 'jump,place', envB.order.join(','));
+  check('(b) already-checked Terms: log says it was already checked',
+    envB.$('scab-log')._html.indexOf('already checked') !== -1);
+
+  // (c) Auto-Pay OFF: ZERO checkout clicks.
+  const envC = makeExpressEnv();
+  const resC = await envC.bot.runExpressCheckoutWalk();
+  check('(c) Auto-Pay OFF: walk refuses', resC.ok === false && resC.reason === 'autopay_off', JSON.stringify(resC));
+  check('(c) Auto-Pay OFF: zero checkout clicks', envC.order.length === 0, envC.order.join(','));
+  check('(c) Auto-Pay OFF: log says it will NOT click any of the three',
+    envC.$('scab-log')._html.indexOf('Auto-Pay is OFF') !== -1 && envC.$('scab-log')._html.indexOf('will NOT click') !== -1);
+
+  // (d) Terms checkbox missing: Jump runs, then the walk STOPS — Place order is never attempted.
+  const envD = makeExpressEnv({ noTerms: true });
+  setAutoPay(envD, true);
+  const resD = await envD.bot.runExpressCheckoutWalk();
+  check('(d) missing Terms checkbox: walk fails at step 2', resD.ok === false && resD.reason === 'terms_not_found', JSON.stringify(resD));
+  check('(d) missing Terms checkbox: Jump ran, Place order was NEVER attempted',
+    envD.order.indexOf('jump') !== -1 && envD.order.indexOf('place') === -1, envD.order.join(','));
+  check('(d) missing Terms checkbox: log says the walk stopped and later steps will NOT run',
+    envD.$('scab-log')._html.indexOf('STOPPED') !== -1 && envD.$('scab-log')._html.indexOf('later steps will NOT run') !== -1);
+
+  // (e) Payment form asking for card details: the walk stops BEFORE any click.
+  const envE = makeExpressEnv({ cardField: true });
+  setAutoPay(envE, true);
+  const resE = await envE.bot.runExpressCheckoutWalk();
+  check('(e) card details needed: walk refuses', resE.ok === false && resE.reason === 'needs_payment_details', JSON.stringify(resE));
+  check('(e) card details needed: zero clicks', envE.order.length === 0, envE.order.join(','));
+  check('(e) card details needed: log says the bot NEVER types card details',
+    envE.$('scab-log')._html.indexOf('NEVER types card details') !== -1);
 
   delete global.MouseEvent;
 })().then(() => {

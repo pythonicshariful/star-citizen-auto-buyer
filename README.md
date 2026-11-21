@@ -20,7 +20,11 @@ limited ship the moment it comes back in stock — for example the
    It never buys above the max price you set.
 3. **Adds it to your cart and walks through checkout** — but it **stops
    at the payment step** unless you switch Auto-Pay on. It never types
-   card details.
+   card details. On the express checkout page, with Auto-Pay ON, it
+   walks the final steps itself (v1.3.0): clicks **"Jump to bottom"**,
+   checks the **Terms of Service** box, then clicks **"Place order"**.
+   With Auto-Pay OFF it clicks none of those — it stops at the
+   checkout page and waits for you.
 4. **Clicks Buy Now like a human (v1.1.0).** When a Buy Now button
    shows up, it scrolls it into view, moves the mouse to a random
    point inside the button on a random curved path (random steps and
@@ -124,7 +128,7 @@ Do this before any real release, so you know it works:
 - Keep the poll speed as set (8–15 seconds). Faster checking looks
   more like a bot and can get the account blocked.
 
-## What is proven / not proven (v1.2.2, 2026-11-21)
+## What is proven / not proven (v1.3.0, 2026-11-21)
 
 | | Status |
 |---|---|
@@ -136,14 +140,15 @@ Do this before any real release, so you know it works:
 | CAPTCHA pause only on a real visible challenge | ✅ Fixed in v1.1.1 — a normal RSI page (reCAPTCHA badge text in the page, badge iframe in the DOM) no longer pauses the bot on Start; a genuinely visible challenge (checkbox / image challenge / hCaptcha) still pauses + alarms. Regression-tested |
 | Start Monitor → Buy Now on a watched in-stock page | ✅ Fixed in v1.1.2 (page matching), v1.2.1 (scroll-then-click) and v1.2.2 (MouseEvent fix, below) — the DOM Buy Now click never fired for any "Name - 10 Year" ship, the click used a stale position while the smooth scroll was still running, and then the mouse event itself failed to build inside Tampermonkey ("Failed to construct 'MouseEvent' … 'view' … 'Window'") so nothing was clicked even with the button found and the price under max. Regression-tested (PTV, Meteor, Kraken, First Flight Pack pages; sandbox-mimicking MouseEvent test). **Still needs a real-browser check:** open the test product's own page, press Start, and watch it click Buy Now and go to the cart (it stops at payment — Auto-Pay OFF) |
 | No page-refresh polling | ✅ Proven — the script contains no page refresh; only API calls |
-| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (180 checks) — the bot scrolls the button into view FIRST, waits for the scroll/layout to settle, re-reads the position, checks the button is really visible and not covered, then random point, curved path, random hover/hold timings; a covered / off-screen / disabled button is NOT clicked. **v1.2.2:** the mouse events are now built without a `view` property, so they construct inside the Tampermonkey sandbox (the old `view: window` threw "Failed to construct 'MouseEvent'" on a real page and nothing was clicked). **Not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (227 checks) — the bot scrolls the button into view FIRST, waits for the scroll/layout to settle, re-reads the position, checks the button is really visible and not covered, then random point, curved path, random hover/hold timings; a covered / off-screen / disabled button is NOT clicked. **v1.2.2:** the mouse events are now built without a `view` property, so they construct inside the Tampermonkey sandbox (the old `view: window` threw "Failed to construct 'MouseEvent'" on a real page and nothing was clicked). **Not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
+| Express checkout walk — Jump to bottom → Terms → Place order (v1.3.0) | ✅ Proven in harness — the three steps run in order on the express checkout page, matched by button text ("Jump to bottom") and `data-testid` (Terms checkbox, Place order); the Terms checkbox is never matched by its React id, is clicked via its label, and is verified checked afterwards; a failed step stops the walk and Place order is never attempted; Auto-Pay OFF means zero checkout clicks; a page asking for card details stops the walk (the bot never types card details). **Not live-proven on a real express checkout page yet** — needs a test in a real logged-in browser with a cheap in-stock item, Auto-Pay ON, stopping to check the confirmation |
 | Panel draggable + resizable | ✅ Proven in harness — drag the header to move, drag the bottom-right corner to resize (width 20–60%, height 25–90% of the window, same as the Microsoft bot); position/size save in Tampermonkey storage and restore on every page; double-click the header to reset. **Not live-proven in a real browser yet** |
 | Every panel button works | ✅ Proven in harness (fake-browser test) — Start starts monitoring, Stop stops it (and clears a PAUSED state), Test runs a dry-run check, Add product adds + rejects duplicates, Remove (✕) removes that product, Auto-Pay checkbox flips the setting. **Not live-proven in a real browser yet** |
 | Add-to-cart + checkout steps | ⚠️ Built from RSI's own store code, **not yet proven live** — needs a test in a real logged-in browser with a cheap in-stock item, stopping before payment |
 | Buying a Kraken in a real wave | ❌ Not proven — no wave was live during testing, and no real purchase was made |
 
 Test evidence: `test/live-test-2026-11-21.json` (live API results),
-`test/test-harness.js` (180 checks), `RESEARCH.md` (full findings).
+`test/test-harness.js` (227 checks), `RESEARCH.md` (full findings).
 
 ## Files
 
@@ -155,6 +160,8 @@ Test evidence: `test/live-test-2026-11-21.json` (live API results),
 - `test/fixtures/` — real + synthetic API responses used by the tests
 
 ## Version
+
+v1.3.0 — 2026-11-21. Express-checkout walk: on the express checkout page (`.../store/pledge/express-checkout`) the bot now walks the final three steps in order, ONLY when Auto-Pay is ON in the panel (Auto-Pay stays OFF by default): (1) click "Jump to bottom" — matched by its button TEXT, never by class or data-cy-id alone (other buttons share those); (2) check the Terms of Service box — matched by `data-testid="express-terms-checkbox"`, NEVER by its id (React generates a new id on every render), clicked via its label so the React handler fires, and verified checked afterwards (already-checked skips the click); (3) click "Place order" — matched by `data-testid="express-card-form-submit"`. Each step re-finds its element after a short settle wait and checks it is visible and clickable before the human-like click (scroll-then-click, random curved path, v1.2.2 MouseEvent construction); if any step fails the walk STOPS there and later steps are never attempted. When Auto-Pay is OFF the bot clicks NONE of the three — it stops at the checkout page with an alarm, exactly as before (and turning Auto-Pay ON while on the page runs the walk). The bot NEVER types card details or CVV: if the page shows a payment form that still needs card details, the walk stops and alarms instead. The panel Auto-Pay label now says plainly that ON means the bot places the order itself. Harness 227/227 (47 new checks in section 16, including a fake-browser end-to-end walk: happy path in order, already-checked Terms, Auto-Pay OFF = zero clicks, missing Terms stops before Place order, card-details page stops before any click). No change to scroll-then-click, the any-product watchlist, API-only stock checks, max-price guard, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
 v1.2.2 — 2026-11-21. Fixed the mouse-click error that stopped Buy Now from working on a real page: the button was found and the price guard passed, but the click never happened — "Failed to construct 'MouseEvent': Failed to read the 'view' property from 'UIEventInit': Failed to convert value to 'Window'." Cause: the bot passed `view: window` to `new MouseEvent(...)`, but inside Tampermonkey the script's `window` is a sandbox proxy, not the page's real Window, so the constructor rejects it. `view` is optional (it defaults to null and no click handler reads it), so it is simply not passed anymore, with a legacy createEvent / initMouseEvent fallback if the modern constructor ever throws. A click failure is now also logged plainly ("Buy Now click FAILED … will retry on the next tick") instead of hiding behind "continuing with API checks", and the loop retries the DOM click on the next tick while the button is still available. Harness 180/180 (11 new checks in section 15, including a sandbox-mimicking MouseEvent test that reproduces the exact live error). No change to scroll-then-click, the any-product watchlist, API-only stock checks, max-price guard, CAPTCHA pause on visible challenges only, or Auto-Pay default OFF.
 
