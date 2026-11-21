@@ -90,7 +90,8 @@ check('backoff capped at 120s', dCap === 120000, String(dCap));
 check('script contains NO location.reload() (code, comments stripped)', !/location\.reload\s*\(/.test(SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')));
 check('script contains NO polling via location.href assignment except cart nav', (() => {
   const hits = SRC.match(/location\.href\s*=/g) || [];
-  return hits.length === 1 && SRC.includes("/store/pledge/cart");
+  const cartNavs = (SRC.match(/location\.href\s*=\s*RSI_ORIGIN\s*\+\s*'\/store\/pledge\/cart'/g) || []).length;
+  return hits.length === cartNavs && cartNavs >= 1 && cartNavs <= 2;
 })());
 check('script contains NO setInterval page refresh', !/setInterval\s*\(\s*\(\s*\)\s*=>\s*\{?\s*location/.test(SRC));
 check('script never fills CAPTCHA fields', !/captcha.*\.value\s*=|g-recaptcha-response/i.test(SRC.replace(/detectBlocker[\s\S]*?return null;/, '')));
@@ -105,6 +106,28 @@ console.log('== 8. Safety defaults ==');
 check('autoPay defaults OFF', bot.DEFAULT_CONFIG.autoPay === false);
 check('default watchlist is Kraken, max $1400, warbond first', bot.DEFAULT_CONFIG.watchlist[0].name === 'Kraken' && bot.DEFAULT_CONFIG.watchlist[0].maxPrice === 1400 && bot.DEFAULT_CONFIG.watchlist[0].preferWarbond === true);
 check('default poll window is 8-15s', bot.DEFAULT_CONFIG.pollMinMs === 8000 && bot.DEFAULT_CONFIG.pollMaxMs === 15000);
+
+console.log('== 9. Human-like click (v1.1.0) ==');
+check('humanClick defaults ON', bot.DEFAULT_CONFIG.humanClick === true);
+check('randInt stays in range', (() => { for (let i = 0; i < 100; i++) { const v = bot.randInt(8, 30); if (v < 8 || v > 30) return false; } return true; })());
+check('randomPointInRect stays inside 10-90% of the button', (() => {
+  const rect = { left: 100, top: 200, width: 200, height: 50 };
+  for (let i = 0; i < 100; i++) { const p = bot.randomPointInRect(rect); if (p.x < 120 || p.x > 280 || p.y < 205 || p.y > 245) return false; }
+  return true;
+})());
+check('humanPath returns requested steps and ends at target', (() => {
+  const pts = bot.humanPath({ x: 0, y: 0 }, { x: 100, y: 50 }, 15, () => 0.5);
+  return pts.length === 15 && pts[14].x === 100 && pts[14].y === 50;
+})());
+check('humanPath is curved, not a straight line', (() => {
+  const pts = bot.humanPath({ x: 0, y: 0 }, { x: 100, y: 0 }, 10, () => 0.9);
+  return pts.some((p) => p.y !== 0);
+})());
+check('Buy Now selectors include the pasted button', bot.BUY_NOW_SELECTORS.includes('[data-testid="express-buy-now"]') && bot.BUY_NOW_SELECTORS.includes('.a-buyNowButton') && bot.BUY_NOW_SELECTORS.includes('button[aria-label="Buy Now"]') && bot.BUY_NOW_SELECTORS.includes('.m-storeAction__buyNow'));
+check('script defines humanClick + humanMoveTo + findBuyNowButton', SRC.includes('async function humanClick') && SRC.includes('async function humanMoveTo') && SRC.includes('function findBuyNowButton'));
+check('humanClick dispatches mousemove / mousedown / mouseup / click with random delays', SRC.includes("'mousemove'") && SRC.includes("'mousedown'") && SRC.includes("'mouseup'") && SRC.includes("'click'") && SRC.includes('randInt(8, 30)') && SRC.includes('randInt(80, 350)'));
+check('Place Order uses humanClick, not instant btn.click()', !/btn\.click\s*\(\)/.test(SRC) && SRC.includes('await humanClick(btn)'));
+check('loop checks DOM Buy Now before API (fallback if API lags)', SRC.includes('clickBuyNowIfAvailable()'));
 
 console.log('\n----------------------------------------');
 console.log('PASS: ' + pass + '   FAIL: ' + fail);

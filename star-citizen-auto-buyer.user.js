@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.0.0
-// @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Final payment is OFF by default.
+// @version      1.1.0
+// @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
 // @grant        GM_getValue
@@ -15,8 +15,26 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.0.0
+ * Star Citizen Auto Buyer — v1.1.0
  * =================================
+ * HOW IT CLICKS LIKE A HUMAN (v1.1.0):
+ *   When a Buy Now / Place Order button is available, the bot does NOT
+ *   call el.click() instantly. It scrolls the button into view, picks a
+ *   RANDOM point inside the button, moves the mouse there along a
+ *   RANDOM curved path (random steps, random 8-30 ms gaps, random hover
+ *   pause 80-350 ms), then mousedown → short random hold 40-150 ms →
+ *   mouseup → click. No two clicks take the same path or timing.
+ *   Honest limit: Tampermonkey events are synthetic, so the browser
+ *   marks them isTrusted=false — a site that checks that flag can still
+ *   tell they were scripted. The random path removes the obvious
+ *   "instant jump straight to the centre" signal, but it does NOT make
+ *   a synthetic click a real trusted mouse click. A truly trusted click
+ *   needs a real mouse, or browser automation (CDP / Playwright mouse).
+ *   Buttons matched: [data-testid="express-buy-now"],
+ *   button[aria-label="Buy Now"], .a-buyNowButton,
+ *   .m-storeAction__buyNow, plus any visible button whose text is
+ *   "Buy Now" / "Add to Cart" / "Place Order" on a watched ship page.
+ *
  * HOW IT CHECKS STOCK (no page refresh, ever):
  *   The RSI store is a JavaScript app. Its own frontend asks the RSI server
  *   for stock with a GraphQL query at /graphql (operation
@@ -84,6 +102,7 @@ const DEFAULT_CONFIG = {
   pollMaxMs: 15000,         // slowest gap between stock checks
   maxBackoffMs: 120000,     // longest wait after repeated errors / 429s
   autoPay: false,           // FINAL PAYMENT switch — default OFF, see header
+  humanClick: true,         // v1.1.0: Buy Now / Place Order via random human-like mouse path, not instant el.click()
   soundAlert: true,
   desktopAlert: true,
 };
@@ -238,6 +257,63 @@ function availabilityFromJsonLd(doc) {
   return 'unknown';
 }
 
+/* --- v1.1.0 human-like click helpers (pure, unit-tested) --- */
+
+/** Random integer in [min, max], inclusive. */
+function randInt(min, max, rnd) {
+  const r = rnd || Math.random;
+  return Math.floor(r() * (Number(max) - Number(min) + 1)) + Number(min);
+}
+
+/** A random point inside a button rect (10%-90% of width/height, never the exact centre). */
+function randomPointInRect(rect, rnd) {
+  const r = rnd || Math.random;
+  const x = rect.left + rect.width * (0.1 + r() * 0.8);
+  const y = rect.top + rect.height * (0.1 + r() * 0.8);
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
+/**
+ * Random curved mouse path from `from` to `to`.
+ * Quadratic Bezier with a random control point offset, `steps` points.
+ * Returns [{x, y}, ...] including the end point, never a straight line.
+ */
+function humanPath(from, to, steps, rnd) {
+  const r = rnd || Math.random;
+  const n = Math.max(2, steps || 12);
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+  // Control point: midpoint pushed sideways by a random amount.
+  const bend = (r() - 0.5) * dist * 0.6;
+  const cx = (from.x + to.x) / 2 - (dy / dist) * bend;
+  const cy = (from.y + to.y) / 2 + (dx / dist) * bend;
+  const pts = [];
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    const x = (1 - t) * (1 - t) * from.x + 2 * (1 - t) * t * cx + t * t * to.x;
+    const y = (1 - t) * (1 - t) * from.y + 2 * (1 - t) * t * cy + t * t * to.y;
+    pts.push({ x: Math.round(x), y: Math.round(y) });
+  }
+  return pts;
+}
+
+/** Selectors for a Buy Now button, including the exact one Shariful pasted. */
+const BUY_NOW_SELECTORS = [
+  '[data-testid="express-buy-now"]',
+  'button[aria-label="Buy Now"]',
+  '.a-buyNowButton',
+  '.m-storeAction__buyNow',
+  'button[data-cy-id="button"]',
+];
+
+/** True when an element is visible and clickable (not disabled / hidden). */
+function isClickableEl(el) {
+  if (!el || el.disabled) return false;
+  if (typeof el.getBoundingClientRect !== 'function') return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Browser runtime — only runs inside Tampermonkey, never in Node.     */
 /* ------------------------------------------------------------------ */
@@ -253,6 +329,7 @@ const BOT = {
   lastCheck: null,
   logLines: [],
   found: null, // { ship, sku } once stock is found
+  mouse: null, // last known mouse position {x, y} for human-like paths
 };
 
 function log(msg) {
@@ -318,6 +395,91 @@ function pauseBot(reason) {
   notify('Star Citizen bot paused', reason);
 }
 
+/* --- v1.1.0 human-like clicking (browser only) --- */
+
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+function dispatchMouse(el, type, x, y) {
+  const ev = new MouseEvent(type, {
+    bubbles: true, cancelable: true, view: window,
+    clientX: x, clientY: y, button: 0, buttons: type === 'mousedown' || type === 'mousemove' ? 1 : 0,
+  });
+  (el || document).dispatchEvent(ev);
+}
+
+/** Move the mouse from the last known position to (x, y) on a random curved path. */
+async function humanMoveTo(x, y) {
+  const from = BOT.mouse || { x: randInt(0, window.innerWidth || 800), y: randInt(0, window.innerHeight || 600) };
+  const steps = randInt(12, 25);
+  const pts = humanPath(from, { x: x, y: y }, steps);
+  for (const p of pts) {
+    dispatchMouse(document, 'mousemove', p.x, p.y);
+    BOT.mouse = p;
+    await sleep(randInt(8, 30));
+  }
+}
+
+/**
+ * Click an element the way a human would: scroll into view, move the
+ * mouse on a random curved path to a random point inside it, hover a
+ * random 80-350 ms, then mousedown → random 40-150 ms hold → mouseup → click.
+ * NOTE: these are synthetic events (isTrusted=false) — see header.
+ */
+async function humanClick(el) {
+  if (!el || !isClickableEl(el)) return false;
+  try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {}
+  await sleep(randInt(200, 600));
+  const rect = el.getBoundingClientRect();
+  const target = randomPointInRect(rect);
+  await humanMoveTo(target.x, target.y);
+  dispatchMouse(el, 'mouseover', target.x, target.y);
+  dispatchMouse(el, 'mouseenter', target.x, target.y);
+  await sleep(randInt(80, 350)); // human hover pause
+  dispatchMouse(el, 'mousedown', target.x, target.y);
+  await sleep(randInt(40, 150)); // human hold
+  dispatchMouse(el, 'mouseup', target.x, target.y);
+  dispatchMouse(el, 'click', target.x, target.y);
+  BOT.mouse = target;
+  return true;
+}
+
+/** Find a visible, enabled Buy Now button on this page, if one is showing. */
+function findBuyNowButton(doc) {
+  const d = doc || document;
+  for (const sel of BUY_NOW_SELECTORS) {
+    const els = d.querySelectorAll(sel);
+    for (const el of els) {
+      if (isClickableEl(el)) return el;
+    }
+  }
+  // Fallback: any visible button whose text says Buy Now / Add to Cart.
+  const btns = d.querySelectorAll('button');
+  for (const b of btns) {
+    const t = (b.textContent || '').trim().toLowerCase();
+    if ((t === 'buy now' || t.includes('buy now') || t.includes('add to cart')) && isClickableEl(b)) return b;
+  }
+  return null;
+}
+
+/** If a Buy Now button is available on a watched ship page, click it human-like. */
+async function clickBuyNowIfAvailable() {
+  if (!BOT.config.humanClick) return false;
+  const url = window.location.href.toLowerCase();
+  const onWatchedPage = BOT.config.watchlist.some((w) => {
+    const name = String(w.name || '').toLowerCase();
+    return url.includes(name.replace(/\s+/g, '-')) || url.includes(name.replace(/\s+/g, ''));
+  });
+  if (!onWatchedPage) return false;
+  const btn = findBuyNowButton(document);
+  if (!btn) return false;
+  log('Buy Now button is available on this page — clicking it with random human-like mouse movement…');
+  const ok = await humanClick(btn);
+  if (ok) log('Buy Now clicked (human-like path).');
+  return ok;
+}
+
 async function gql(body) {
   const res = await fetch(GRAPHQL_URL, {
     method: 'POST',
@@ -369,6 +531,18 @@ async function loopTick() {
   if (BOT.status !== 'MONITORING') return;
   const blocker = detectBlocker(document.body ? document.body.innerText : '');
   if (blocker) { pauseBot('RSI shows a ' + blocker + ' screen.'); return; }
+  // v1.1.0: if a Buy Now button is already showing on a watched ship
+  // page, click it human-like right away (API list can lag the page).
+  try {
+    if (await clickBuyNowIfAvailable()) {
+      setStatus('IN STOCK');
+      notify('Buy Now clicked!', 'The Buy Now button was available and clicked with human-like mouse movement. Check the cart now.');
+      window.location.href = RSI_ORIGIN + '/store/pledge/cart';
+      return;
+    }
+  } catch (e) {
+    log('Buy Now DOM check failed: ' + e.message + ' — continuing with API checks.');
+  }
   try {
     const found = await checkAllShips();
     BOT.errors = 0;
@@ -446,8 +620,8 @@ async function checkoutStepHandler() {
     log('Auto-Pay is ON: looking for an already-selected saved payment method. Card details are NEVER typed by this bot.');
     const btn = Array.from(document.querySelectorAll('button')).find((b) => /place order|pay now|confirm/i.test(b.textContent || '') && !b.disabled);
     if (btn) {
-      log('Clicking the Place Order button once (saved payment must already be selected).');
-      btn.click();
+      log('Clicking the Place Order button once with random human-like mouse movement (saved payment must already be selected).');
+      await humanClick(btn);
       setStatus('DONE');
     } else {
       log('Auto-Pay is ON but no enabled Place Order button was found — pay yourself.');
@@ -495,7 +669,7 @@ function buildPanel() {
   panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
   panel.innerHTML =
     '<div style="display:flex;justify-content:space-between;align-items:center;">' +
-    '<b>🚀 SC Auto Buyer v1.0.0</b>' +
+    '<b>🚀 SC Auto Buyer v1.1.0</b>' +
     '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
@@ -547,5 +721,6 @@ if (typeof module !== 'undefined' && module.exports) {
     DEFAULT_CONFIG, parseShipNameFromUrl, priceUsd, stockState, withinCap,
     findTargetSku, buildStockQuery, parseStockResponse, buildAddToCartMutation,
     buildNextStepMutation, nextDelayMs, detectBlocker, availabilityFromJsonLd,
+    randInt, randomPointInRect, humanPath, BUY_NOW_SELECTORS, isClickableEl,
   };
 }

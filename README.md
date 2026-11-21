@@ -21,7 +21,15 @@ limited ship the moment it comes back in stock — for example the
 3. **Adds it to your cart and walks through checkout** — but it **stops
    at the payment step** unless you switch Auto-Pay on. It never types
    card details.
-4. **Stops for CAPTCHAs and queues.** If RSI shows a CAPTCHA, a queue
+4. **Clicks Buy Now like a human (v1.1.0).** When a Buy Now button
+   shows up, it scrolls it into view, moves the mouse to a random
+   point inside the button on a random curved path (random steps and
+   timing, random hover pause), then clicks. It never does an instant
+   `el.click()` straight to the centre. Honest limit: Tampermonkey
+   clicks are synthetic (`isTrusted=false`), so a site checking that
+   flag can still tell — the random path only removes the obvious
+   instant-jump signal.
+5. **Stops for CAPTCHAs and queues.** If RSI shows a CAPTCHA, a queue
    or a "verify you are human" screen, the bot pauses, sounds an alarm
    and waits for you. It never tries to solve a CAPTCHA by itself.
 
@@ -90,18 +98,19 @@ Do this before any real release, so you know it works:
 - Keep the poll speed as set (8–15 seconds). Faster checking looks
   more like a bot and can get the account blocked.
 
-## What is proven / not proven (v1.0.0, 2026-11-21)
+## What is proven / not proven (v1.1.0, 2026-11-21)
 
 | | Status |
 |---|---|
 | Stock check via RSI's own GraphQL API | ✅ Proven live — Kraken correctly shows "not listed" while out of stock; PTV ($15) and First Flight Pack ($60) correctly show in stock; Pioneer correctly shows out of stock |
-| Picking the Warbond version under the max price | ✅ Proven — 40/40 automated tests (`node test/test-harness.js`) |
+| Picking the Warbond version under the max price | ✅ Proven — 50/50 automated tests (`node test/test-harness.js`) |
 | No page-refresh polling | ✅ Proven — the script contains no page refresh; only API calls |
+| Human-like Buy Now click (random curved mouse path) | ✅ Proven in harness (50/50) — random point, curved path, random hover/hold timings; **not live-proven on a real Buy Now button yet**. Note: synthetic clicks are `isTrusted=false`; only a real mouse / CDP mouse makes a truly trusted click |
 | Add-to-cart + checkout steps | ⚠️ Built from RSI's own store code, **not yet proven live** — needs a test in a real logged-in browser with a cheap in-stock item, stopping before payment |
 | Buying a Kraken in a real wave | ❌ Not proven — no wave was live during testing, and no real purchase was made |
 
 Test evidence: `test/live-test-2026-11-21.json` (live API results),
-`test/test-harness.js` (40 checks), `RESEARCH.md` (full findings).
+`test/test-harness.js` (50 checks), `RESEARCH.md` (full findings).
 
 ## Files
 
@@ -114,4 +123,4 @@ Test evidence: `test/live-test-2026-11-21.json` (live API results),
 
 ## Version
 
-v1.0.0 — 2026-11-21. Built for Fiverr order FO42A585D35C8 (superdrol).
+v1.1.0 — 2026-11-21. Human-like Buy Now click (random curved mouse path, random point/timing). Built for Fiverr order FO42A585D35C8 (superdrol).
