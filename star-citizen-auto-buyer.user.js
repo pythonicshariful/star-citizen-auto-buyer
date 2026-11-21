@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.2.1
+// @version      1.2.2
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -15,8 +15,23 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.2.1
+ * Star Citizen Auto Buyer — v1.2.2
  * =================================
+ * v1.2.2 FIX (2026-11-21): the Buy Now click itself threw on the real
+ *   RSI page, so the button was found, the price guard passed — and
+ *   still nothing was clicked. The live error was:
+ *   "Failed to construct 'MouseEvent': Failed to read the 'view'
+ *   property from 'UIEventInit': Failed to convert value to 'Window'."
+ *   Cause: dispatchMouse passed `view: window` to `new MouseEvent(...)`,
+ *   but inside Tampermonkey the script's `window` is a sandbox proxy,
+ *   NOT the page's real Window, so the constructor rejects it. `view`
+ *   is OPTIONAL (it defaults to null and no click handler reads it),
+ *   so it is simply not passed anymore — with a legacy createEvent /
+ *   initMouseEvent fallback if the modern constructor ever throws.
+ *   A click failure is now also logged plainly ("Buy Now click FAILED
+ *   ... will retry on the next tick") instead of hiding behind
+ *   "continuing with API checks", and the loop retries the DOM click
+ *   on the next tick while the button is still available.
  * v1.2.1 (2026-11-21): the Buy Now click now scrolls FIRST and only
  *   then clicks — and the panel can be moved and resized.
  *   CLICK FIX: the old code scrolled the button into view with a
@@ -706,9 +721,43 @@ function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+/**
+ * Build a mouse event that works inside the Tampermonkey sandbox.
+ *
+ * v1.2.2 — the live v1.2.1 bug: dispatchMouse passed `view: window`
+ * to `new MouseEvent(...)`. Inside Tampermonkey the script's `window`
+ * is a sandbox proxy, NOT the page's real Window, so the constructor
+ * threw on the real RSI page:
+ *   "Failed to construct 'MouseEvent': Failed to read the 'view'
+ *   property from 'UIEventInit': Failed to convert value to 'Window'."
+ * `view` is OPTIONAL (it defaults to null and no click handler reads
+ * it) — so it is simply not passed anymore. If the modern constructor
+ * throws for any reason, fall back to the legacy createEvent /
+ * initMouseEvent path (also with a null view); if that fails too, the
+ * ORIGINAL error is re-thrown so the caller can log it.
+ */
+function makeMouseEvent(type, init) {
+  init = init || {};
+  var err = null;
+  try {
+    return new MouseEvent(type, init);
+  } catch (e) { err = e; }
+  try {
+    var doc = (typeof document !== 'undefined') ? document : null;
+    if (doc && typeof doc.createEvent === 'function') {
+      var ev = doc.createEvent('MouseEvents');
+      ev.initMouseEvent(type, !!init.bubbles, !!init.cancelable, null, type === 'click' ? 1 : 0,
+        init.clientX || 0, init.clientY || 0, init.clientX || 0, init.clientY || 0,
+        false, false, false, false, init.button || 0, null);
+      return ev;
+    }
+  } catch (e2) { /* fall through to re-throw the original error */ }
+  throw err;
+}
+
 function dispatchMouse(el, type, x, y) {
-  const ev = new MouseEvent(type, {
-    bubbles: true, cancelable: true, view: window,
+  const ev = makeMouseEvent(type, {
+    bubbles: true, cancelable: true,
     clientX: x, clientY: y, button: 0, buttons: type === 'mousedown' || type === 'mousemove' ? 1 : 0,
   });
   (el || document).dispatchEvent(ev);
@@ -815,14 +864,25 @@ async function humanClick(el) {
   }
   if (!target) { log('Button is covered by another element — not clicking blind.'); return false; }
   // 4. Human-like mouse movement to the verified point, hover, hold, click.
-  await humanMoveTo(target.x, target.y);
-  dispatchMouse(el, 'mouseover', target.x, target.y);
-  dispatchMouse(el, 'mouseenter', target.x, target.y);
-  await sleep(randInt(80, 350)); // human hover pause
-  dispatchMouse(el, 'mousedown', target.x, target.y);
-  await sleep(randInt(40, 150)); // human hold
-  dispatchMouse(el, 'mouseup', target.x, target.y);
-  dispatchMouse(el, 'click', target.x, target.y);
+  // v1.2.2: if building/dispatching the mouse events throws (e.g. the
+  // Tampermonkey sandbox rejecting the event — the live v1.2.1
+  // "Failed to construct 'MouseEvent'" error), say so PLAINLY and
+  // return false — the loop retries the DOM click on the next tick
+  // while the button is still available. Never swallow it as a quiet
+  // "continuing with API checks".
+  try {
+    await humanMoveTo(target.x, target.y);
+    dispatchMouse(el, 'mouseover', target.x, target.y);
+    dispatchMouse(el, 'mouseenter', target.x, target.y);
+    await sleep(randInt(80, 350)); // human hover pause
+    dispatchMouse(el, 'mousedown', target.x, target.y);
+    await sleep(randInt(40, 150)); // human hold
+    dispatchMouse(el, 'mouseup', target.x, target.y);
+    dispatchMouse(el, 'click', target.x, target.y);
+  } catch (e) {
+    log('Buy Now click FAILED: ' + (e && e.message ? e.message : e) + ' — will retry on the next tick while the button is still available.');
+    return false;
+  }
   BOT.mouse = target;
   return true;
 }
@@ -940,7 +1000,9 @@ async function loopTick() {
       return;
     }
   } catch (e) {
-    log('Buy Now DOM check failed: ' + e.message + ' — continuing with API checks.');
+    // v1.2.2: say it plainly — the DOM click will be retried on the next
+    // tick (it runs before the API checks every tick), it is NOT given up on.
+    log('Buy Now DOM check failed: ' + e.message + ' — will retry the DOM click on the next tick; API checks continue meanwhile.');
   }
   try {
     const found = await checkAllShips();
@@ -1325,6 +1387,7 @@ if (typeof module !== 'undefined' && module.exports) {
     entryMatchesPage, isRsiUrl, normalizeWatchEntry, isApiCheckable,
     pagePriceUsd, domBuyAllowed,
     isRectInViewport, pointHitsElement, scrollIntoViewAndSettle, humanClick,
+    makeMouseEvent,
     clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
     startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
   };
