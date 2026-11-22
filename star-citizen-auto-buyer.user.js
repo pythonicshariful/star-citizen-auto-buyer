@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.4
+// @version      1.3.5
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -16,8 +16,39 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.4
+ * Star Citizen Auto Buyer — v1.3.5
  * =================================
+ * v1.3.5 FIX (2026-11-22): "Start monitoring" on the express checkout
+ *   page did NOTHING — live 2026-11-22 12:40, First Flight Pack,
+ *   Auto-Pay ON, v1.3.4. The bot arrived on express-checkout after
+ *   Buy Now, Shariful pressed Start at 12:36:42, and the log just
+ *   repeated the "page-only" reminder every 8-15s — no "Express
+ *   checkout" line at all, Jump to bottom present, visible and
+ *   enabled, never clicked. A fresh tab opened by the inspector DID
+ *   run the walk on its own (Jump → Terms → stopped at Place order,
+ *   disabled — no saved payment method on the test account).
+ *   Root cause: the walk was triggered ONLY on panel boot
+ *   (setTimeout(runExpressCheckoutWalk, 3000) in buildPanel) and on
+ *   the Auto-Pay toggle. RSI navigates product → express checkout
+ *   inside the page (SPA client-side routing, NO full reload), so
+ *   Tampermonkey does NOT re-run, the panel is NOT rebuilt, and the
+ *   boot trigger never fires — the panel log proves it: "Panel
+ *   ready" appears ONCE (12:35:43, product page), never again after
+ *   arriving on express checkout. And startLoop() never called the
+ *   walk at all: it only started the API loop, whose loopTick()
+ *   on an express page just logs the page-only reminder. Three
+ *   triggers now, so the walk can no longer be missed:
+ *   (1) Start pressed on the express page runs the walk directly
+ *   (Auto-Pay OFF = zero clicks + a clear message, as before);
+ *   (2) the monitoring loop itself checks the page route on every
+ *   tick — on express checkout it stops the API loop and runs the
+ *   walk, on the cart it resumes the pending checkout;
+ *   (3) a 1s URL watcher catches SPA navigations to express
+ *   checkout / cart with NO reload and NO Start press, and starts
+ *   the walk / resume. The walk still runs Jump → Terms → Place
+ *   order, Auto-Pay gated, no card details typed, Place order
+ *   disabled (no saved payment method) still stops at step 3 with
+ *   the clear message. Harness 357 -> see section 21.
  * v1.3.4 FIX (2026-11-21): two things Shariful asked for.
  *   (1) The card-details guard is REMOVED ENTIRELY. The 18:04 live
  *   run still showed the "Express checkout needs card details"
@@ -316,7 +347,7 @@
  * @version metadata above, so the panel always shows the version
  * that is actually installed. (v1.3.0–v1.3.3 the header hardcoded
  * "v1.3.0", so the panel never showed the real version.) */
-const SCAB_VERSION = '1.3.4';
+const SCAB_VERSION = '1.3.5';
 function scabVersion() {
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
@@ -814,6 +845,8 @@ const BOT = {
   mouse: null, // last known mouse position {x, y} for human-like paths
   expressWalk: 'idle', // v1.3.0: idle | running | done | stopped (express-checkout walk state, one run per page load)
   checkoutRetries: 0, // v1.3.4: failed cart checkout-step attempts in a row (bounded retries, see checkoutStepHandler)
+  lastUrl: null, // v1.3.5: URL the SPA watcher last saw (detects client-side navigation with no reload)
+  urlWatcher: null, // v1.3.5: setInterval id for the SPA URL watcher (one per panel)
 };
 
 function log(msg) {
@@ -1131,6 +1164,20 @@ function isCartPage(url) {
 }
 
 /**
+ * What kind of page is this URL? 'express-checkout' | 'cart' | 'monitor'.
+ * v1.3.5: the Start button, the monitoring loop and the SPA URL watcher
+ * all route on this one function, so the express walk can no longer be
+ * missed when RSI navigates without a reload.
+ */
+function pageRoute(url) {
+  const u = String(url || '').toLowerCase();
+  if (!u) return 'monitor';
+  if (u.indexOf('express-checkout') !== -1) return 'express-checkout';
+  if (u.indexOf('/store/pledge/cart') !== -1) return 'cart';
+  return 'monitor';
+}
+
+/**
  * Find the "Jump to bottom" button on the express checkout page,
  * regardless of whether it is clickable yet — the walk waits for it
  * to appear and become enabled separately. Matched by its TEXT, not
@@ -1385,6 +1432,44 @@ async function checkAllShips() {
 
 async function loopTick() {
   if (BOT.status !== 'MONITORING') return;
+  // v1.3.5: the monitoring loop routes on the page, not just on API
+  // results. RSI navigates product → express checkout inside the page
+  // (SPA, no reload), so a MONITORING loop that arrived there must
+  // switch to the checkout walk instead of logging page-only reminders
+  // forever — live 2026-11-22 the log repeated "page-only" every
+  // 8-15s while Jump to bottom sat there unclicked. Same for the cart:
+  // resume the pending checkout instead of polling.
+  const route = pageRoute(window.location.href);
+  if (route === 'express-checkout') {
+    clearTimeout(BOT.timer); BOT.timer = null;
+    // v1.3.5: Auto-Pay OFF means zero checkout clicks — and the walk
+    // must NOT run here, because its Auto-Pay-OFF branch CLEARS the
+    // pending flag (a stopped walk is no longer pending). Clearing it
+    // on a passive loop tick would kill the cart resume for a
+    // checkout the user may still finish by hand. Log the reason and
+    // stop the loop instead.
+    if (!BOT.config.autoPay) {
+      setStatus('CHECKOUT');
+      log('On the express checkout page while monitoring — Auto-Pay is OFF. The bot will NOT click "Jump to bottom", the Terms checkbox or "Place order". Turn Auto-Pay ON in the panel to let the bot place the order, or finish it yourself.');
+      notify('Express checkout — Auto-Pay is OFF', 'The bot stopped at the checkout page. Pay yourself, or turn Auto-Pay ON.');
+      return;
+    }
+    if (BOT.expressWalk !== 'running') BOT.expressWalk = 'idle';
+    log('On the express checkout page while monitoring — switching to the checkout walk (Jump to bottom → Terms → Place order)…');
+    await runExpressCheckoutWalk();
+    return;
+  }
+  if (route === 'cart') {
+    clearTimeout(BOT.timer); BOT.timer = null;
+    if (checkoutPendingValid(loadCheckoutPending())) {
+      log('On the cart page while monitoring — resuming the pending checkout walk…');
+      await checkoutStepHandler();
+    } else {
+      setStatus('IDLE');
+      log('On the cart page with no pending checkout — nothing to walk. Open a product page and press Start, or finish the cart yourself.');
+    }
+    return;
+  }
   const blocker = detectBlocker(document);
   if (blocker) { pauseBot('RSI shows a ' + blocker + ' screen.'); return; }
   // v1.1.0: if a Buy Now button is already showing on a watched ship
@@ -1436,6 +1521,27 @@ function scheduleNext() {
 
 function startLoop() {
   if (BOT.status === 'MONITORING') return;
+  // v1.3.5: Start on the express checkout page means "run the walk",
+  // NOT "start API monitoring". Live 2026-11-22 Shariful pressed
+  // Start on this page and nothing happened — startLoop never called
+  // the walk, it only started loopTick, which logs page-only reminders
+  // on a checkout page. Reset the walk state first so a previously
+  // stopped walk retries instead of being stuck on 'stopped'.
+  if (isExpressCheckoutPage(window.location.pathname)) {
+    BOT.errors = 0;
+    if (BOT.expressWalk !== 'running') BOT.expressWalk = 'idle';
+    setStatus('CHECKOUT');
+    log('Start pressed on the express checkout page — running the checkout walk (Jump to bottom → Terms → Place order)…');
+    runExpressCheckoutWalk();
+    return;
+  }
+  if (isCartPage(window.location.pathname) && checkoutPendingValid(loadCheckoutPending())) {
+    BOT.errors = 0;
+    setStatus('CHECKOUT');
+    log('Start pressed on the cart page — resuming the pending checkout walk…');
+    checkoutStepHandler();
+    return;
+  }
   BOT.errors = 0;
   BOT.found = null;
   // v1.3.1: a fresh monitoring run drops any stale checkout-pending
@@ -1692,6 +1798,52 @@ function maybeResumeCheckout(delayMs, opts) {
   BOT.checkoutRetries = 0; // v1.3.4: fresh resume, fresh retry budget
   setTimeout(function () { checkoutStepHandler(opts); }, (delayMs === undefined ? 3000 : delayMs));
   return true;
+}
+
+/* --- v1.3.5: SPA URL watcher ---
+ * RSI navigates product → express checkout (and → cart) inside the
+ * page with client-side routing — NO full reload, so Tampermonkey
+ * does NOT re-run and the panel is NOT rebuilt. The boot trigger in
+ * buildPanel (setTimeout 3s) therefore never fires on such a
+ * navigation, and the walk was missed entirely (live 2026-11-22:
+ * "Panel ready" appeared ONCE, on the product page). This watcher
+ * polls the URL every 1s; when it changes to express checkout it
+ * stops the API loop and starts the walk, and when it changes to
+ * the cart it resumes a pending checkout. No reload and no Start
+ * press needed. One watcher per panel (guarded by BOT.urlWatcher). */
+function watchUrlChanges() {
+  if (BOT.urlWatcher) return;
+  try { BOT.lastUrl = window.location.href; } catch (e) { BOT.lastUrl = null; }
+  BOT.urlWatcher = setInterval(() => {
+    try {
+      const href = window.location.href;
+      if (href === BOT.lastUrl) return;
+      BOT.lastUrl = href;
+      const route = pageRoute(href);
+      if (route === 'express-checkout') {
+        // v1.3.5: the watcher is PASSIVE — with Auto-Pay OFF it logs
+        // once and does nothing. Running the walk here would clear the
+        // pending flag the Buy Now click just saved (the walk's
+        // Auto-Pay-OFF stop clears it), which killed the cart resume
+        // in the harness (live pattern: Buy Now -> SPA navigation ->
+        // watcher fires before the flag is even read).
+        if (!BOT.config.autoPay) {
+          log('Page changed to express checkout (RSI navigated inside the page, no reload) — Auto-Pay is OFF, so the bot will not click anything here. Turn Auto-Pay ON or finish the order yourself.');
+          return;
+        }
+        log('Page changed to express checkout (RSI navigated inside the page, no reload) — starting the checkout walk…');
+        clearTimeout(BOT.timer); BOT.timer = null;
+        if (BOT.expressWalk !== 'running') BOT.expressWalk = 'idle';
+        if (BOT.status === 'MONITORING') setStatus('CHECKOUT');
+        setTimeout(runExpressCheckoutWalk, 1000);
+      } else if (route === 'cart') {
+        if (checkoutPendingValid(loadCheckoutPending())) {
+          log('Page changed to the cart (no reload) — resuming the pending checkout walk…');
+          setTimeout(() => checkoutStepHandler(), 1000);
+        }
+      }
+    } catch (e) { /* never let the watcher kill the panel */ }
+  }, 1000);
 }
 
 /* v1.3.4: one failed cart-checkout attempt. Retries are bounded:
@@ -1965,7 +2117,7 @@ function buildPanel() {
     '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
     '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
     '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order — ON = the bot places the order itself (express checkout too: Jump to bottom → Terms → Place order). OFF = bot stops at payment.</label>' +
-    '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
+    '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. On the express checkout page, Start runs the checkout walk (Jump to bottom → Terms → Place order). Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
     '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
     '<div id="scab-resize-grip" title="Drag to resize the panel" style="position:absolute;right:2px;bottom:2px;width:18px;height:18px;cursor:nwse-resize;touch-action:none;display:flex;align-items:flex-end;justify-content:flex-end;color:#64748b;font-size:13px;line-height:1;z-index:2;">↘</div>';
   document.body.appendChild(panel);
@@ -2045,6 +2197,9 @@ function buildPanel() {
     });
   }
 
+  // v1.3.5: watch for SPA navigations (product → express checkout /
+  // cart with no reload) — the boot trigger below never fires then.
+  watchUrlChanges();
   // v1.3.1: if we landed on the cart after a Buy Now / add-to-cart,
   // resume the checkout walk from the pending flag saved before the
   // navigation. The old check used BOT.found, which is always null on
@@ -2095,6 +2250,7 @@ if (typeof module !== 'undefined' && module.exports) {
     isCartPage, maybeResumeCheckout, saveCheckoutPending, loadCheckoutPending,
     clearCheckoutPending, checkoutPendingValid, clickBuyNowIfAvailable,
     clickReacted, waitForClickReaction,
+    pageRoute, watchUrlChanges,
     clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
     startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
   };

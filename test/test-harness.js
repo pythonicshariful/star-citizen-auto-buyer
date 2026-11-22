@@ -1562,9 +1562,9 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('panel header shows the version from the userscript metadata',
     SRC.includes('scab-version') && SRC.includes('scabVersion()'));
   check('scabVersion() returns the @version (fallback path, no GM_info in Node)',
-    bot.scabVersion() === '1.3.4');
+    bot.scabVersion() === '1.3.5');
   check('@version metadata matches the SCAB_VERSION fallback',
-    /@version\s+1\.3\.4/.test(SRC) && bot.SCAB_VERSION === '1.3.4');
+    /@version\s+1\.3\.5/.test(SRC) && bot.SCAB_VERSION === '1.3.5');
   check('panel header no longer hardcodes a stale version',
     SRC.indexOf('SC Auto Buyer v1.3.0') === -1);
   // --- pure: Place-order-like finders ---
@@ -1605,7 +1605,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   clearPending();
   const envV = makeCartEnv();
   check('panel renders a version element with the current version',
-    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.4') !== -1);
+    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.5') !== -1);
 
   // --- behavioral: full multi-page flow, hands-off ---
   // (a) Product page -> cart -> express-checkout: the walk
@@ -1624,7 +1624,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   const envCart20 = makeCartEnv();
   const cartAdvanced20 = await waitForCond(() => envCart20.$('scab-log')._html.indexOf('Advanced one checkout step.') !== -1, 6000);
   check('(a) cart page: the walk resumed from the flag',
-    envCart20.$('scab-log')._html.indexOf('Resuming the checkout walk on the cart page') !== -1);
+    envCart20.bot.BOT.logLines.join(' ').indexOf('Resuming the checkout walk on the cart page') !== -1);
   check('(a) cart page: a checkout step ran', cartAdvanced20 === true);
   check('(a) cart page: the flag stays while the walk is in progress',
     !!envCart20.bot.loadCheckoutPending());
@@ -1632,7 +1632,12 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   // already ON (pre-seeded config, as on the buyer's account).
   gmStore['scab_config'] = JSON.stringify({ autoPay: true });
   const envExp20 = makeExpressEnv();
-  const expDone20 = await waitForCond(() => envExp20.order.join(',') === 'jump,terms,place', 12000);
+  // v1.3.5: wait for the walk AND the DONE status together — the
+  // order becomes 'jump,terms,place' a beat before setStatus('DONE')
+  // runs, and a stale env's walk can clobber the shared-registry
+  // status element afterwards, so the moment both hold is the one to
+  // observe (same reason waitForCond exists).
+  const expDone20 = await waitForCond(() => envExp20.order.join(',') === 'jump,terms,place' && envExp20.$('scab-status').textContent === 'DONE', 12000);
   check('(a) express page: the walk auto-ran (no Start press)',
     expDone20 === true, envExp20.order.join(','));
   check('(a) express page: status is DONE',
@@ -1657,7 +1662,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     !!flagB20);
   gmStore['scab_config'] = JSON.stringify({ autoPay: true });
   const envExpB20 = makeExpressEnv();
-  const expDoneB20 = await waitForCond(() => envExpB20.order.join(',') === 'jump,terms,place', 12000);
+  const expDoneB20 = await waitForCond(() => envExpB20.order.join(',') === 'jump,terms,place' && envExpB20.$('scab-status').textContent === 'DONE', 12000);
   check('(b) direct path: the walk auto-ran on the express page',
     expDoneB20 === true, envExpB20.order.join(','));
   check('(b) direct path: status is DONE',
@@ -1803,6 +1808,102 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     envJ20.order.length === 0 && envJ20.$('scab-log')._html.indexOf('No saved payment method is selected') !== -1);
   check('(j) Place Order never enables: flag cleared',
     envJ20.bot.loadCheckoutPending() === null);
+  delete gmStore['scab_config'];
+  clearPending();
+
+  console.log('== 21. Start / loop / SPA navigation trigger the express walk (v1.3.5) ==');
+  // REGRESSION (live 2026-11-22 12:40, First Flight Pack, Auto-Pay ON,
+  // v1.3.4): the bot arrived on express checkout after Buy Now, Shariful
+  // pressed Start at 12:36:42, and the log just repeated the "page-only"
+  // reminder every 8-15s — no "Express checkout" line at all, Jump to
+  // bottom present, visible and enabled, never clicked. A fresh tab DID
+  // run the walk on its own. Root cause: the walk was triggered ONLY on
+  // panel boot (setTimeout 3s) and on the Auto-Pay toggle. RSI navigates
+  // product -> express checkout inside the page (SPA, no reload), so the
+  // panel is never rebuilt and the boot trigger never fires — "Panel
+  // ready" appeared ONCE (product page). And startLoop() never called
+  // the walk. Three triggers now: Start, the monitoring loop, and a 1s
+  // URL watcher.
+  // --- pure: pageRoute ---
+  check('pageRoute: express checkout URL routes to the walk',
+    bot.pageRoute('https://robertsspaceindustries.com/en/store/pledge/express-checkout') === 'express-checkout');
+  check('pageRoute: cart URL routes to the cart resume',
+    bot.pageRoute('https://robertsspaceindustries.com/en/store/pledge/cart') === 'cart');
+  check('pageRoute: product / other RSI pages route to monitor',
+    bot.pageRoute(KRAKEN.url) === 'monitor' && bot.pageRoute('https://robertsspaceindustries.com/en/') === 'monitor' && bot.pageRoute('') === 'monitor');
+  check('script exports pageRoute + watchUrlChanges',
+    Object.prototype.hasOwnProperty.call(bot, 'pageRoute') && Object.prototype.hasOwnProperty.call(bot, 'watchUrlChanges'));
+  // --- static: the three triggers exist in the script ---
+  check('Start on the express page runs the walk (startLoop branches on the page)',
+    SRC.includes("if (isExpressCheckoutPage(window.location.pathname))") &&
+    SRC.indexOf('Start pressed on the express checkout page') !== -1 &&
+    SRC.indexOf('runExpressCheckoutWalk();', SRC.indexOf('Start pressed on the express checkout page')) !== -1);
+  check('Start resets a stopped walk so it retries instead of staying stopped',
+    SRC.includes("if (BOT.expressWalk !== 'running') BOT.expressWalk = 'idle';"));
+  check('the monitoring loop routes on the page every tick (express -> walk, cart -> resume)',
+    SRC.includes("const route = pageRoute(window.location.href);") &&
+    SRC.includes("if (route === 'express-checkout')") &&
+    SRC.includes("if (route === 'cart')"));
+  check('a 1s URL watcher catches SPA navigations with no reload',
+    SRC.includes('function watchUrlChanges()') && SRC.includes('setInterval(') &&
+    SRC.includes('Page changed to express checkout') && SRC.includes('watchUrlChanges();'));
+  check('the SPA watcher does NOT run the walk with Auto-Pay OFF (the walk\'s OFF stop clears the pending flag the Buy Now click just saved)',
+    SRC.includes('Auto-Pay is OFF, so the bot will not click anything here'));
+  check('the monitoring loop does NOT run the walk with Auto-Pay OFF on the express page (same flag reason)',
+    SRC.includes("On the express checkout page while monitoring — Auto-Pay is OFF"));
+  check('the panel tells the buyer Start runs the walk on express checkout',
+    SRC.includes('On the express checkout page, Start runs the checkout walk'));
+  // --- behavioral: Start pressed on the express page runs the walk ---
+  // (a) Auto-Pay ON, all three steps present: Jump + Terms + Place order.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envA21 = makeExpressEnv();
+  setAutoPay(envA21, true);
+  envA21.bot.startLoop();
+  await new Promise((r) => setTimeout(r, 6000));
+  check('(a) Start on express checkout + Auto-Pay ON: the walk ran (jump -> terms -> place)',
+    envA21.order.join(',') === 'jump,terms,place', envA21.order.join(','));
+  check('(a) Start on express checkout + Auto-Pay ON: status DONE',
+    envA21.$('scab-status').textContent === 'DONE');
+  // v1.3.5: read the log from BOT.logLines, not the panel element —
+  // the fake document shares one id registry across envs, so a stale
+  // env's log() can overwrite this env's panel log element in the
+  // background; logLines is the env's own source of truth.
+  check('(a) Start on express checkout + Auto-Pay ON: log says Start ran the walk',
+    envA21.bot.BOT.logLines.join(' ').indexOf('Start pressed on the express checkout page') !== -1);
+  delete gmStore['scab_config'];
+  clearPending();
+  // (b) Auto-Pay OFF: Start on the express page clicks NOTHING.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envB21 = makeExpressEnv();
+  envB21.bot.startLoop();
+  await new Promise((r) => setTimeout(r, 1500));
+  check('(b) Start on express checkout + Auto-Pay OFF: zero checkout clicks',
+    envB21.order.length === 0, envB21.order.join(','));
+  check('(b) Start on express checkout + Auto-Pay OFF: log says Auto-Pay is OFF',
+    envB21.bot.BOT.logLines.join(' ').indexOf('Auto-Pay is OFF') !== -1);
+  delete gmStore['scab_config'];
+  clearPending();
+  // (c) The live 2026-11-22 case, replayed: Place order DISABLED (test
+  // account, no saved payment method) — Jump + Terms run, then the walk
+  // stops at step 3 with the clear message, exactly as the fresh tab did.
+  clearPending();
+  delete gmStore['scab_config'];
+  const envC21 = makeExpressEnv({ placeDisabled: true });
+  setAutoPay(envC21, true);
+  envC21.bot.startLoop();
+  // v1.3.5: the walk waits ~15s for Place order to become enabled
+  // before it stops, so poll for the stop message instead of a fixed
+  // short sleep (and read BOT.logLines, not the shared-registry panel
+  // element — see (a)).
+  const stoppedC21 = await waitForCond(() =>
+    envC21.bot.BOT.logLines.join(' ').indexOf('never became enabled') !== -1 ||
+    envC21.bot.BOT.logLines.join(' ').indexOf('No saved payment method') !== -1, 22000);
+  check('(c) Start on express checkout, Place order disabled: Jump + Terms ran, Place never clicked',
+    envC21.order.join(',') === 'jump,terms', envC21.order.join(','));
+  check('(c) Start on express checkout, Place order disabled: stops with the saved-payment message',
+    stoppedC21 === true);
   delete gmStore['scab_config'];
   clearPending();
 
