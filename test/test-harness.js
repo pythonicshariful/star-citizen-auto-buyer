@@ -1562,9 +1562,9 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('panel header shows the version from the userscript metadata',
     SRC.includes('scab-version') && SRC.includes('scabVersion()'));
   check('scabVersion() returns the @version (fallback path, no GM_info in Node)',
-    bot.scabVersion() === '1.3.6');
+    bot.scabVersion() === '1.3.7');
   check('@version metadata matches the SCAB_VERSION fallback',
-    /@version\s+1\.3\.6/.test(SRC) && bot.SCAB_VERSION === '1.3.6');
+    /@version\s+1\.3\.7/.test(SRC) && bot.SCAB_VERSION === '1.3.7');
   check('panel header no longer hardcodes a stale version',
     SRC.indexOf('SC Auto Buyer v1.3.0') === -1);
   // --- pure: Place-order-like finders ---
@@ -1605,7 +1605,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   clearPending();
   const envV = makeCartEnv();
   check('panel renders a version element with the current version',
-    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.6') !== -1);
+    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.7') !== -1);
 
   // --- behavioral: full multi-page flow, hands-off ---
   // (a) Product page -> cart -> express-checkout: the walk
@@ -1614,7 +1614,10 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   delete gmStore['scab_config'];
   const envA20 = makeBuyNowEnv({ reacts: 'cart' });
   envA20.$('scab-start').click();
-  const flagA20 = await waitForCond(() => envA20.bot.loadCheckoutPending(), 4000);
+  // v1.3.7: the flag is saved after the human-like click + up to 2s
+  // reaction wait — 4s was marginal on a loaded VM (flaky fail once),
+  // 8s leaves real margin.
+  const flagA20 = await waitForCond(() => envA20.bot.loadCheckoutPending(), 8000);
   check('(a) product page: Buy Now click saved the pending flag',
     !!flagA20 && flagA20.source === 'dom_buy_now' && flagA20.product === 'Star Citizen First Flight Pack', JSON.stringify(flagA20));
   check('(a) product page: bot navigated to the cart (RSI did not go to express directly)',
@@ -1655,7 +1658,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   delete gmStore['scab_config'];
   const envB20 = makeBuyNowEnv({ reacts: 'navigate' });
   envB20.$('scab-start').click();
-  const flagB20 = await waitForCond(() => envB20.bot.loadCheckoutPending(), 4000);
+  const flagB20 = await waitForCond(() => envB20.bot.loadCheckoutPending(), 8000);
   check('(b) direct path: Buy Now navigated straight to express checkout',
     envB20.win.location.href === EXPRESS_URL, envB20.win.location.href);
   check('(b) direct path: pending flag saved',
@@ -1955,6 +1958,104 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('Max below Min is raised to Min (30s / 30s)',
     envD22.bot.BOT.config.pollMinMs === 30000 && envD22.bot.BOT.config.pollMaxMs === 30000 &&
     String(min22.value) === '30' && String(max22.value) === '30');
+  delete gmStore['scab_config'];
+  clearPending();
+
+  console.log('== 23. Console API log + list-ID auto-detect (v1.3.7) ==');
+  // --- pure: findListForProduct ---
+  const fl = bot.findListForProduct;
+  const lists23 = [
+    { id: '72', skus: [{ title: 'PTV - 10 Year' }, { title: 'Pioneer - 10 Year' }] },
+    { id: '45', skus: [{ title: 'Star Citizen First Flight Pack' }] },
+  ];
+  check('findListForProduct finds First Flight Pack in list 45',
+    fl(lists23, 'Star Citizen First Flight Pack') === '45');
+  check('findListForProduct is case-insensitive',
+    fl(lists23, 'first flight pack') === '45');
+  check('findListForProduct finds PTV in list 72',
+    fl(lists23, 'PTV - 10 Year') === '72');
+  check('findListForProduct returns the FIRST matching list',
+    fl([{ id: '72', skus: [{ title: 'Aurora MR' }] }, { id: '45', skus: [{ title: 'Aurora MR Starter Pack' }] }], 'Aurora MR') === '72');
+  check('findListForProduct returns null when no list holds it',
+    fl(lists23, 'No Such Ship XYZ') === null);
+  check('findListForProduct returns null for an empty name',
+    fl(lists23, '') === null && fl(lists23, null) === null);
+  // --- static: known lists, console hook, add-form wiring ---
+  check('KNOWN_STORE_LISTS covers Ships 72, Packages 45, Upgrades 241, Paints 268, Packs 270',
+    ['72', '45', '241', '268', '270'].every((id) => bot.KNOWN_STORE_LISTS.some((l) => l.id === id)));
+  check('gql logs every API call to the console (operation + raw response)',
+    SRC.includes("consoleApi('API ' + (body && body.operationName") && SRC.includes('function consoleApi'));
+  check('checkOneShip logs one readable console line per stock check',
+    SRC.includes("consoleApi('Stock check list ' + ship.productId"));
+  check('consoleApi is browser-only (silent in Node)',
+    (SRC.match(/function consoleApi[\s\S]*?\n}/) || [''])[0].indexOf('if (!isBrowser) return;') !== -1);
+  check('Add form runs auto-detect when no list ID is given',
+    SRC.includes('detectListId(entry).then(') && SRC.includes('finding the store list') && SRC.includes("btn.addEventListener('click', () =>"));
+  check('Add pushes the entry BEFORE detection (never waits on the network)',
+    (() => {
+      const h = (SRC.match(/function bindWatchlistForm[\s\S]*?\n}/) || [''])[0];
+      return h.indexOf('BOT.config.watchlist.push(entry);') !== -1 &&
+        h.indexOf('BOT.config.watchlist.push(entry);') < h.indexOf('detectListId(entry).then(');
+    })());
+  check('panel tells the user the list ID is auto-detected when empty',
+    SRC.includes('auto-detected if empty') && SRC.includes('the bot finds the right list itself'));
+  // --- behavioral: detectListId with a per-list fetch stub ---
+  const realFetch23 = global.fetch;
+  global.fetch = async (url, opts) => {
+    let listId = '';
+    try { listId = JSON.parse(opts.body).variables.query.products.ids[0]; } catch (e) {}
+    const skus = listId === '45'
+      ? [{ id: '19607', title: 'Star Citizen First Flight Pack', isWarbond: false, stock: { available: true }, price: { amount: 6000 } }]
+      : listId === '72'
+        ? [{ id: '17209', title: 'PTV - 10 Year', isWarbond: false, stock: { available: true }, price: { amount: 1500 } }]
+        : [];
+    return { status: 200, ok: true, json: async () => ({ data: { store: { search: { count: 1, resources: [{ id: listId, title: 'list ' + listId, skus: skus }] } } } }) };
+  };
+  const envDet = makeCartEnv();
+  const found45 = await envDet.bot.detectListId({ name: 'Star Citizen First Flight Pack' });
+  check('detectListId finds First Flight Pack in list 45 (not 72)',
+    found45 === '45', String(found45));
+  const foundNone = await envDet.bot.detectListId({ name: 'No Such Ship XYZ' });
+  check('detectListId returns null when no list holds the product',
+    foundNone === null, String(foundNone));
+  // --- behavioral: console lines from a real stock check ---
+  global.fetch = async () => ({ status: 200, ok: true, json: async () => loadFixture('kraken-absent-product72.json') });
+  const envC23 = makeCartEnv();
+  const rC23 = await envC23.bot.checkOneShip({ name: 'Kraken', productId: '72', maxPrice: 1400, preferWarbond: true });
+  check('checkOneShip still returns not_listed for Kraken (console hook did not break it)',
+    rC23.reason === 'not_listed' && rC23.sku === null);
+  check('console lines record the API call and the stock-check summary',
+    envC23.bot.BOT.consoleLines.some((l) => l.indexOf('API GetProductWithSkusPrice') === 0) &&
+    envC23.bot.BOT.consoleLines.some((l) => l.indexOf('Stock check list 72:') === 0 && l.indexOf('Kraken: not_listed') !== -1),
+    envC23.bot.BOT.consoleLines.join(' | '));
+  // --- behavioral: Add with no list ID auto-detects 45 for First Flight Pack ---
+  global.fetch = async (url, opts) => {
+    let listId = '';
+    try { listId = JSON.parse(opts.body).variables.query.products.ids[0]; } catch (e) {}
+    const skus = listId === '45'
+      ? [{ id: '19607', title: 'Star Citizen First Flight Pack', isWarbond: false, stock: { available: true }, price: { amount: 6000 } }]
+      : [];
+    return { status: 200, ok: true, json: async () => ({ data: { store: { search: { count: 1, resources: [{ id: listId, title: 'list ' + listId, skus: skus }] } } } }) };
+  };
+  const envAdd23 = makeCartEnv();
+  envAdd23.$('scab-add-url').value = FFP_URL;
+  envAdd23.$('scab-add-price').value = '100';
+  envAdd23.$('scab-add-btn').click();
+  // v1.3.7 fix (2026-11-22): the entry is added AT ONCE (page-only),
+  // so waiting only for its presence proves nothing — wait for the
+  // background auto-detect to upgrade it to list 45.
+  const added23 = await waitForCond(() => {
+    const w = envAdd23.bot.BOT.config.watchlist.find((x) => x.name === 'Star Citizen First Flight Pack');
+    return !!(w && w.productId === '45');
+  }, 5000);
+  const addedEntry23 = envAdd23.bot.BOT.config.watchlist.find((w) => w.name === 'Star Citizen First Flight Pack');
+  check('Add with no list ID auto-detects list 45 and saves it',
+    added23 === true && addedEntry23 && addedEntry23.productId === '45',
+    addedEntry23 ? JSON.stringify(addedEntry23.productId) : 'not added');
+  check('Add message says the list was auto-detected',
+    envAdd23.$('scab-add-msg') && envAdd23.$('scab-add-msg').textContent.indexOf('list 45 (auto-detected)') !== -1,
+    envAdd23.$('scab-add-msg') ? envAdd23.$('scab-add-msg').textContent : 'no msg');
+  global.fetch = realFetch23;
   delete gmStore['scab_config'];
   clearPending();
 

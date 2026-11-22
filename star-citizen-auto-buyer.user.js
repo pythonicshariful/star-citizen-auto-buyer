@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.6
+// @version      1.3.7
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -16,8 +16,28 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.6
+ * Star Citizen Auto Buyer — v1.3.7
  * =================================
+ * v1.3.7 (2026-11-22): console API log + list-ID auto-detect.
+ *   (1) Every GraphQL call now also writes to the browser console
+ *   (DevTools → Console): one readable line per stock check
+ *   ("Stock check list 72: 224 SKUs — Kraken: not_listed") plus the
+ *   raw API response as an expandable object, and one line per
+ *   add-to-cart / checkout call ("API AddCartMultiItemMutation").
+ *   (2) The List ID field is now optional in practice: leave it empty
+ *   and the bot tries the known store lists itself (72 Standalone
+ *   Ships, 45 Packages, 241 Ship Upgrades, 268 Paints, 270 Packs —
+ *   from the store's own router data) and saves the first list whose
+ *   SKUs contain the product's name (same title match the stock
+ *   check already uses). The product is added AT ONCE (page-only)
+ *   and the list is filled in a moment later in the background —
+ *   the first version awaited detection before adding, which broke
+ *   every flow that presses Start right after Add (23 harness
+ *   checks), so Add never waits on the network now.
+ *   Verified live 2026-11-22: First Flight
+ *   Pack is SKU 19607, $60, in stock in list 45 — and NOT in list
+ *   72 (224 SKUs, zero matches). If no list holds it, the product
+ *   stays page-only as before. Harness 391 -> see section 23.
  * v1.3.6 (2026-11-22): check speed from the panel + gaming UI.
  *   (1) The stock check already waited a RANDOM time between
  *   pollMinMs/pollMaxMs (8–15s) — but the numbers lived only in the
@@ -359,7 +379,7 @@
  * @version metadata above, so the panel always shows the version
  * that is actually installed. (v1.3.0–v1.3.3 the header hardcoded
  * "v1.3.0", so the panel never showed the real version.) */
-const SCAB_VERSION = '1.3.6';
+const SCAB_VERSION = '1.3.7';
 function scabVersion() {
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
@@ -829,6 +849,38 @@ function isApiCheckable(entry) {
     String(entry.productId).trim() !== '' && /^\d+$/.test(String(entry.productId)));
 }
 
+/**
+ * Store lists the bot knows, from the store's own router data
+ * (window.__RSI_STORE_V2__ productsId on any pledge page).
+ * v1.3.7: used by the list-ID auto-detect — the bot tries each list
+ * until one holds the product being added.
+ */
+const KNOWN_STORE_LISTS = [
+  { id: '72', label: 'Standalone Ships' },
+  { id: '45', label: 'Packages' },
+  { id: '241', label: 'Ship Upgrades' },
+  { id: '268', label: 'Paints' },
+  { id: '270', label: 'Packs' },
+];
+
+/**
+ * Pure: which known list holds a product with this name? `lists` is an
+ * array of { id, skus } — returns the first list id whose SKUs contain
+ * a title with the name (same title match findTargetSku uses), else
+ * null. First match wins.
+ */
+function findListForProduct(lists, name) {
+  const needle = String(name || '').trim().toLowerCase();
+  if (!needle) return null;
+  for (const entry of lists || []) {
+    const skus = entry && Array.isArray(entry.skus) ? entry.skus : [];
+    for (const s of skus) {
+      if (String(s && s.title ? s.title : '').toLowerCase().includes(needle)) return entry.id;
+    }
+  }
+  return null;
+}
+
 /** Read the price (USD) off the current product page's JSON-LD, if it has one. Returns a number or null. */
 function pagePriceUsd(doc) {
   try {
@@ -874,6 +926,7 @@ const BOT = {
   errors: 0,
   lastCheck: null,
   logLines: [],
+  consoleLines: [], // v1.3.7: API lines also written to the browser console (testable copy)
   found: null, // { ship, sku } once stock is found
   mouse: null, // last known mouse position {x, y} for human-like paths
   expressWalk: 'idle', // v1.3.0: idle | running | done | stopped (express-checkout walk state, one run per page load)
@@ -1407,6 +1460,38 @@ async function clickBuyNowIfAvailable() {
   return { entry: entry, alreadyNavigating: navigating };
 }
 
+/**
+ * v1.3.7: show API info in the browser console (DevTools → Console).
+ * Every line is also kept in BOT.consoleLines so the harness can assert
+ * on it. Silent in Node (isBrowser is false there), so tests stay clean.
+ */
+function consoleApi(tag, obj) {
+  try { BOT.consoleLines.push(tag); } catch (e) {}
+  if (!isBrowser) return;
+  try {
+    if (typeof console !== 'undefined' && console.log) console.log('[SC Auto Buyer] ' + tag, obj);
+  } catch (e) {}
+}
+
+/**
+ * v1.3.7: try each known store list until one holds the product.
+ * Returns the list id, or null when no list holds it (the product
+ * stays page-only). A failed/unreachable list is skipped, never fatal.
+ */
+async function detectListId(entry) {
+  if (!isBrowser) return null;
+  for (const list of KNOWN_STORE_LISTS) {
+    try {
+      const json = await gql(buildStockQuery(list.id, 1000));
+      const resources = (json && json.data && json.data.store && json.data.store.search && json.data.store.search.resources) || [];
+      const skus = [];
+      for (const r of resources) if (r && Array.isArray(r.skus)) skus.push.apply(skus, r.skus);
+      if (findListForProduct([{ id: list.id, skus: skus }], entry.name) === list.id) return list.id;
+    } catch (e) { /* try the next list */ }
+  }
+  return null;
+}
+
 async function gql(body) {
   const res = await fetch(GRAPHQL_URL, {
     method: 'POST',
@@ -1420,7 +1505,10 @@ async function gql(body) {
   });
   if (res.status === 429) throw new Error('rate_limited_429');
   if (!res.ok) throw new Error('http_' + res.status);
-  return res.json();
+  const json = await res.json();
+  // v1.3.7: every API call + its raw response lands in the console.
+  consoleApi('API ' + (body && body.operationName ? body.operationName : 'GraphQL'), json);
+  return json;
 }
 
 /** One stock check for one watched product. Returns { ship, sku, reason }. */
@@ -1438,6 +1526,9 @@ async function checkOneShip(ship) {
   const parsed = parseStockResponse(json);
   if (parsed.error) throw new Error(parsed.error);
   const found = findTargetSku(parsed.skus, ship);
+  // v1.3.7: one readable console line per stock check (raw response
+  // already logged by gql above as an expandable object).
+  consoleApi('Stock check list ' + ship.productId + ': ' + parsed.skus.length + ' SKUs — ' + ship.name + ': ' + found.reason + (found.sku ? ' → ' + found.sku.title + ' $' + priceUsd(found.sku.price.amount) : ''));
   return { ship: ship, sku: found.sku, reason: found.reason, checkedSkus: parsed.skus.length };
 }
 
@@ -2047,6 +2138,12 @@ function bindWatchlistForm() {
     const entry = res.entry;
     const dupe = (BOT.config.watchlist || []).some((w) => String(w.url || '').toLowerCase() === entry.url.toLowerCase());
     if (dupe) { setMsg('That product is already in the watchlist.', false); return; }
+    // v1.3.7: add IMMEDIATELY (page-only when no list ID was given),
+    // so the product is in the watchlist the moment the button is
+    // pressed — the list auto-detect then upgrades it in the
+    // background. The first version awaited detection before adding,
+    // which broke every flow that presses Start right after Add (the
+    // entry was not there yet) — never make Add wait on the network.
     BOT.config.watchlist.push(entry);
     saveConfig();
     renderWatchlist();
@@ -2057,6 +2154,18 @@ function bindWatchlistForm() {
     if (warbondEl) warbondEl.checked = false;
     setMsg('Added: ' + entry.name + ' (max $' + entry.maxPrice + ')' + (isApiCheckable(entry) ? '' : ' — page only, keep its page open.'), true);
     log('Added to watchlist: ' + entry.name + ' (max $' + entry.maxPrice + ')' + (isApiCheckable(entry) ? ' — list ' + entry.productId : ' — page only'));
+    if (!isApiCheckable(entry)) {
+      setMsg('Added: ' + entry.name + ' — finding the store list…', true);
+      detectListId(entry).then((foundList) => {
+        if (!foundList) { log('No store list holds ' + entry.name + ' — staying page-only (keep its product page open).'); return; }
+        entry.productId = foundList;
+        saveConfig();
+        renderWatchlist();
+        const label = (KNOWN_STORE_LISTS.filter((l) => l.id === foundList)[0] || {}).label || '';
+        log('List auto-detected for ' + entry.name + ': ' + foundList + (label ? ' (' + label + ')' : '') + '.');
+        setMsg('Added: ' + entry.name + ' (max $' + entry.maxPrice + ') — list ' + foundList + ' (auto-detected)', true);
+      }).catch(() => { /* detection never breaks the add */ });
+    }
   });
 }
 
@@ -2185,11 +2294,11 @@ function buildPanel() {
     '<input id="scab-add-name" placeholder="Name (optional — filled in from the URL)" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;">' +
     '<div style="display:flex;gap:6px;margin-top:6px;">' +
     '<input id="scab-add-price" type="number" min="1" step="0.01" placeholder="Max price $" style="flex:1;min-width:0;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;">' +
-    '<input id="scab-add-list" placeholder="List ID (optional, e.g. 72)" style="flex:1;min-width:0;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;"></div>' +
+    '<input id="scab-add-list" placeholder="List ID (optional — auto-detected if empty)" style="flex:1;min-width:0;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;"></div>' +
     '<label style="display:block;margin-top:6px;font-size:12px;"><input type="checkbox" id="scab-add-warbond"> Prefer Warbond (cheaper version first)</label>' +
     '<button id="scab-add-btn" style="width:100%;margin-top:6px;padding:8px;border:0;background:linear-gradient(135deg,#16a34a,#4ade80);color:#04120a;font-weight:800;letter-spacing:.5px;cursor:pointer;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);">Add product</button>' +
     '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
-    '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
+    '<div style="font-size:11px;color:#94a3b8;">List ID: leave it empty and the bot finds the right list itself (Ships 72, Packages 45, Upgrades 241, Paints 268, Packs 270). With no list the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
     '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order — ON = the bot places the order itself (express checkout too: Jump to bottom → Terms → Place order). OFF = bot stops at payment.</label>' +
     '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. On the express checkout page, Start runs the checkout walk (Jump to bottom → Terms → Place order). Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
     '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border:1px solid #164e63;color:#7dd3fc;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
@@ -2310,6 +2419,8 @@ if (typeof module !== 'undefined' && module.exports) {
     randInt, randomPointInRect, humanPath, BUY_NOW_SELECTORS, isClickableEl,
     slugify, isWatchedPage, findBuyNowButton,
     entryMatchesPage, isRsiUrl, normalizeWatchEntry, isApiCheckable,
+    KNOWN_STORE_LISTS, findListForProduct, detectListId, consoleApi, gql,
+    checkOneShip, checkAllShips,
     pagePriceUsd, domBuyAllowed,
     isRectInViewport, pointHitsElement, scrollIntoViewAndSettle, humanClick,
     makeMouseEvent,
