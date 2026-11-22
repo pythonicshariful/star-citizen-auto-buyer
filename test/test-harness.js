@@ -1562,9 +1562,9 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   check('panel header shows the version from the userscript metadata',
     SRC.includes('scab-version') && SRC.includes('scabVersion()'));
   check('scabVersion() returns the @version (fallback path, no GM_info in Node)',
-    bot.scabVersion() === '1.3.5');
+    bot.scabVersion() === '1.3.6');
   check('@version metadata matches the SCAB_VERSION fallback',
-    /@version\s+1\.3\.5/.test(SRC) && bot.SCAB_VERSION === '1.3.5');
+    /@version\s+1\.3\.6/.test(SRC) && bot.SCAB_VERSION === '1.3.6');
   check('panel header no longer hardcodes a stale version',
     SRC.indexOf('SC Auto Buyer v1.3.0') === -1);
   // --- pure: Place-order-like finders ---
@@ -1605,7 +1605,7 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
   clearPending();
   const envV = makeCartEnv();
   check('panel renders a version element with the current version',
-    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.5') !== -1);
+    !!envV.$('scab-version') && envV.$('scab-panel')._html.indexOf('v1.3.6') !== -1);
 
   // --- behavioral: full multi-page flow, hands-off ---
   // (a) Product page -> cart -> express-checkout: the walk
@@ -1904,6 +1904,57 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
     envC21.order.join(',') === 'jump,terms', envC21.order.join(','));
   check('(c) Start on express checkout, Place order disabled: stops with the saved-payment message',
     stoppedC21 === true);
+  console.log('== 22. Min/Max check-speed inputs + gaming UI (v1.3.6) ==');
+  // --- pure: normalizePollDelays ---
+  const nd = bot.normalizePollDelays;
+  check('normalizePollDelays(8, 15) -> 8000/15000',
+    JSON.stringify(nd(8, 15)) === '{"pollMinMs":8000,"pollMaxMs":15000}');
+  check('normalizePollDelays(5, 5) -> equal delays allowed',
+    JSON.stringify(nd(5, 5)) === '{"pollMinMs":5000,"pollMaxMs":5000}');
+  check('normalizePollDelays(30, 10) -> Max raised to Min',
+    JSON.stringify(nd(30, 10)) === '{"pollMinMs":30000,"pollMaxMs":30000}');
+  check('normalizePollDelays(0, 5) -> invalid Min falls back to the 8s default',
+    JSON.stringify(nd(0, 5)) === '{"pollMinMs":8000,"pollMaxMs":8000}');
+  check('normalizePollDelays(1, 400) -> clamped to 2s / 300s',
+    JSON.stringify(nd(1, 400)) === '{"pollMinMs":2000,"pollMaxMs":300000}');
+  check("normalizePollDelays('x', 'y') -> defaults 8s / 15s",
+    JSON.stringify(nd('x', 'y')) === '{"pollMinMs":8000,"pollMaxMs":15000}');
+  // --- pure: the random delay actually comes from the config ---
+  check('nextDelayMs uses the config range (custom 5-9s)',
+    bot.nextDelayMs({ pollMinMs: 5000, pollMaxMs: 9000, maxBackoffMs: 120000 }, 0, () => 0) === 5000 &&
+    bot.nextDelayMs({ pollMinMs: 5000, pollMaxMs: 9000, maxBackoffMs: 120000 }, 0, () => 1) === 9000);
+  // --- static: panel wiring + gaming look ---
+  check('panel has Min/Max delay inputs and a status line',
+    SRC.includes('scab-delay-min') && SRC.includes('scab-delay-max') && SRC.includes('scab-delay-msg'));
+  check('delay inputs are wired through normalizePollDelays + saveConfig',
+    SRC.includes('bindDelayInputs') && SRC.includes('normalizePollDelays(minEl.value, maxEl.value)') && SRC.includes('bindDelayInputs();'));
+  check('panel has the gaming look (neon cyan border/glow, gradient strip, angular buttons, letter-spaced headings)',
+    SRC.includes('#22d3ee') && SRC.includes('linear-gradient(90deg,#22d3ee,#a3e635') && SRC.includes('clip-path:polygon(') && SRC.includes('letter-spacing:1.5px'));
+  check('gaming restyle kept the same buttons, labels and ids',
+    SRC.includes('id="scab-start"') && SRC.includes('▶ Start monitoring') && SRC.includes('⏸ Stop') &&
+    SRC.includes('🔍 Test stock check now (no purchase)') && SRC.includes('ON = the bot places the order itself') &&
+    SRC.includes('id="scab-add-btn"') && SRC.includes('id="scab-autopay"'));
+  // --- behavioral: change the inputs, config follows ---
+  delete gmStore['scab_config'];
+  const envD22 = makeCartEnv();
+  const min22 = envD22.$('scab-delay-min');
+  const max22 = envD22.$('scab-delay-max');
+  check('delay inputs boot from the config (8 / 15)',
+    min22 && max22 && String(min22.value) === '8' && String(max22.value) === '15');
+  min22.value = 5; max22.value = 9;
+  min22.dispatchEvent({ type: 'change' });
+  check('changing Min/Max updates the config (5s / 9s)',
+    envD22.bot.BOT.config.pollMinMs === 5000 && envD22.bot.BOT.config.pollMaxMs === 9000);
+  check('changing Min/Max logs the new random range',
+    envD22.bot.BOT.logLines.join(' ').indexOf('Check speed set: stock checks every ~5–9s') !== -1);
+  check('delay status line shows the new range',
+    envD22.$('scab-delay-msg') && envD22.$('scab-delay-msg').textContent.indexOf('5–9s') !== -1);
+  // Max below Min is raised to Min, and the inputs show the corrected values.
+  min22.value = 30; max22.value = 10;
+  max22.dispatchEvent({ type: 'change' });
+  check('Max below Min is raised to Min (30s / 30s)',
+    envD22.bot.BOT.config.pollMinMs === 30000 && envD22.bot.BOT.config.pollMaxMs === 30000 &&
+    String(min22.value) === '30' && String(max22.value) === '30');
   delete gmStore['scab_config'];
   clearPending();
 

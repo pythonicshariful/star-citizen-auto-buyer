@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Star Citizen Auto Buyer (RSI Pledge Store)
 // @namespace    https://github.com/pythonicshariful/star-citizen-auto-buyer
-// @version      1.3.5
+// @version      1.3.6
 // @description  Monitors RSI pledge-store ships via RSI's own GraphQL API (no page refresh) and auto add-to-cart + checkout when a watched ship comes in stock. Buy Now / Place Order clicks use random human-like mouse movement. Final payment is OFF by default.
 // @author       Shariful Islam (pythonicshariful)
 // @match        https://robertsspaceindustries.com/*
@@ -16,8 +16,20 @@
 // ==/UserScript==
 
 /*
- * Star Citizen Auto Buyer — v1.3.5
+ * Star Citizen Auto Buyer — v1.3.6
  * =================================
+ * v1.3.6 (2026-11-22): check speed from the panel + gaming UI.
+ *   (1) The stock check already waited a RANDOM time between
+ *   pollMinMs/pollMaxMs (8–15s) — but the numbers lived only in the
+ *   config, with no way to change them from the panel. Now the panel
+ *   has Min / Max delay inputs (seconds): every stock check waits a
+ *   fresh random time between them, and the inputs save to the config
+ *   (2s min, 300s max, Max raised to Min when it is below Min).
+ *   (2) The panel got a gaming UI vibe: near-black HUD background,
+ *   neon-cyan border + glow, gradient top strip, uppercase
+ *   letter-spaced headings, angular clip-path buttons, terminal-cyan
+ *   log. Same buttons, same labels, same element ids — only the look
+ *   changed. Harness 375 -> see section 22.
  * v1.3.5 FIX (2026-11-22): "Start monitoring" on the express checkout
  *   page did NOTHING — live 2026-11-22 12:40, First Flight Pack,
  *   Auto-Pay ON, v1.3.4. The bot arrived on express-checkout after
@@ -347,7 +359,7 @@
  * @version metadata above, so the panel always shows the version
  * that is actually installed. (v1.3.0–v1.3.3 the header hardcoded
  * "v1.3.0", so the panel never showed the real version.) */
-const SCAB_VERSION = '1.3.5';
+const SCAB_VERSION = '1.3.6';
 function scabVersion() {
   try {
     if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
@@ -511,6 +523,27 @@ function nextDelayMs(cfg, consecutiveErrors, randomFn) {
   if (!consecutiveErrors || consecutiveErrors <= 0) return Math.round(base);
   const backed = base * Math.pow(2, Math.min(consecutiveErrors, 5));
   return Math.round(Math.min(backed, cfg.maxBackoffMs));
+}
+
+/**
+ * Validate the Min/Max stock-check delay (seconds, from the panel
+ * inputs) into config milliseconds. Bounds: 2s min, 300s max; Max is
+ * raised to Min when it is below Min; missing/invalid values fall back
+ * to the defaults (8s / 15s). Returns { pollMinMs, pollMaxMs }.
+ * v1.3.6: the delay was always random between the two config values,
+ * but the values lived only in the config — now they come from the UI.
+ */
+function normalizePollDelays(minSec, maxSec) {
+  const dfltMin = DEFAULT_CONFIG.pollMinMs / 1000;
+  const dfltMax = DEFAULT_CONFIG.pollMaxMs / 1000;
+  let lo = Number(minSec);
+  let hi = Number(maxSec);
+  if (!isFinite(lo) || lo <= 0) lo = dfltMin;
+  if (!isFinite(hi) || hi <= 0) hi = dfltMax;
+  lo = Math.max(2, Math.min(300, Math.round(lo)));
+  hi = Math.max(2, Math.min(300, Math.round(hi)));
+  if (hi < lo) hi = lo;
+  return { pollMinMs: lo * 1000, pollMaxMs: hi * 1000 };
 }
 
 /**
@@ -2027,6 +2060,35 @@ function bindWatchlistForm() {
   });
 }
 
+/** Wire the Min/Max check-speed inputs (v1.3.6). */
+function bindDelayInputs() {
+  if (!isBrowser) return;
+  const minEl = document.getElementById('scab-delay-min');
+  const maxEl = document.getElementById('scab-delay-max');
+  if (!minEl || !maxEl) return;
+  // Self-heal a saved config (older saves had no bounds).
+  const cur = normalizePollDelays(BOT.config.pollMinMs / 1000, BOT.config.pollMaxMs / 1000);
+  BOT.config.pollMinMs = cur.pollMinMs;
+  BOT.config.pollMaxMs = cur.pollMaxMs;
+  minEl.value = cur.pollMinMs / 1000;
+  maxEl.value = cur.pollMaxMs / 1000;
+  const msgEl = document.getElementById('scab-delay-msg');
+  const show = () => { if (msgEl) msgEl.textContent = 'Checks every ~' + (BOT.config.pollMinMs / 1000) + '–' + (BOT.config.pollMaxMs / 1000) + 's (random each time).'; };
+  show();
+  const apply = () => {
+    const res = normalizePollDelays(minEl.value, maxEl.value);
+    BOT.config.pollMinMs = res.pollMinMs;
+    BOT.config.pollMaxMs = res.pollMaxMs;
+    minEl.value = res.pollMinMs / 1000;
+    maxEl.value = res.pollMaxMs / 1000;
+    saveConfig();
+    show();
+    log('Check speed set: stock checks every ~' + (res.pollMinMs / 1000) + '–' + (res.pollMaxMs / 1000) + 's, random each time.');
+  };
+  minEl.addEventListener('change', apply);
+  maxEl.addEventListener('change', apply);
+}
+
 function renderLog() {
   if (!isBrowser) return;
   const el = document.getElementById('scab-log');
@@ -2094,36 +2156,49 @@ function buildPanel() {
   if (document.getElementById('scab-panel')) return;
   const panel = document.createElement('div');
   panel.id = 'scab-panel';
-  panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;max-width:calc(100vw - 24px);background:#0f172a;color:#e2e8f0;font:13px/1.5 system-ui,sans-serif;border:1px solid #334155;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:12px;';
+  // v1.3.6: gaming UI vibe — near-black HUD background, neon-cyan
+  // border + glow, gradient top strip, uppercase letter-spaced
+  // headings, angular clip-path buttons, terminal-cyan log. Same
+  // buttons, same labels, same element ids — only the look changed.
+  panel.style.cssText = 'position:fixed;top:12px;right:12px;z-index:999999;width:340px;max-width:calc(100vw - 24px);background:linear-gradient(160deg,#070b16 0%,#0b1226 55%,#07130d 100%);color:#dbeafe;font:13px/1.5 system-ui,sans-serif;border:1px solid #22d3ee;border-radius:8px;box-shadow:0 0 0 1px rgba(34,211,238,.35),0 0 28px rgba(34,211,238,.22),0 10px 34px rgba(0,0,0,.65);padding:12px;';
   panel.innerHTML =
+    '<div style="height:3px;margin:-12px -12px 10px;background:linear-gradient(90deg,#22d3ee,#a3e635 55%,#f59e0b);border-radius:8px 8px 0 0;"></div>' +
     '<div id="scab-header" title="Drag to move the panel (double-click to reset position and size)" style="display:flex;justify-content:space-between;align-items:center;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;">' +
-    '<b>🚀 SC Auto Buyer <span id="scab-version">v' + scabVersion() + '</span></b>' +
-    '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:20px;font-size:11px;">IDLE</span></div>' +
+    '<b style="letter-spacing:1.5px;text-transform:uppercase;color:#a5f3fc;text-shadow:0 0 14px rgba(34,211,238,.65);">🎮 SC Auto Buyer <span id="scab-version">v' + scabVersion() + '</span></b>' +
+    '<span id="scab-status" style="background:#0e7490;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:1px;border:1px solid rgba(255,255,255,.25);box-shadow:0 0 10px rgba(34,211,238,.35);">IDLE</span></div>' +
     '<div id="scab-ships" style="margin:8px 0;font-size:12px;"></div>' +
     '<div style="display:flex;gap:6px;flex-wrap:wrap;">' +
-    '<button id="scab-start" style="flex:1;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;">▶ Start monitoring</button>' +
-    '<button id="scab-stop" style="flex:1;padding:7px;border:0;border-radius:6px;background:#475569;color:#fff;cursor:pointer;">⏸ Stop</button></div>' +
-    '<button id="scab-test" style="width:100%;margin-top:6px;padding:7px;border:0;border-radius:6px;background:#0e7490;color:#fff;cursor:pointer;">🔍 Test stock check now (no purchase)</button>' +
-    '<div style="margin-top:10px;border-top:1px solid #334155;padding-top:8px;">' +
-    '<b style="font-size:12px;">➕ Add any product</b>' +
+    '<button id="scab-start" style="flex:1;padding:8px;border:0;background:linear-gradient(135deg,#16a34a,#4ade80);color:#04120a;font-weight:800;letter-spacing:.5px;cursor:pointer;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);">▶ Start monitoring</button>' +
+    '<button id="scab-stop" style="flex:1;padding:8px;border:0;background:#111827;color:#a5f3fc;font-weight:700;letter-spacing:.5px;cursor:pointer;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);">⏸ Stop</button></div>' +
+    '<button id="scab-test" style="width:100%;margin-top:6px;padding:8px;border:0;background:linear-gradient(135deg,#0e7490,#22d3ee);color:#04121a;font-weight:700;letter-spacing:.5px;cursor:pointer;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);">🔍 Test stock check now (no purchase)</button>' +
+    '<div style="margin-top:10px;border-top:1px solid #164e63;padding-top:8px;">' +
+    '<b style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a5f3fc;">⚡ Check speed</b>' +
+    '<div style="font-size:11px;color:#94a3b8;">Stock check waits a random time between Min and Max — a new random wait every check.</div>' +
+    '<div style="display:flex;gap:6px;margin-top:6px;align-items:center;">' +
+    '<label style="flex:1;font-size:12px;">Min <input id="scab-delay-min" type="number" min="2" max="300" step="1" style="width:64px;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;"> s</label>' +
+    '<label style="flex:1;font-size:12px;">Max <input id="scab-delay-max" type="number" min="2" max="300" step="1" style="width:64px;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;"> s</label></div>' +
+    '<div id="scab-delay-msg" style="font-size:11px;color:#4ade80;margin-top:4px;min-height:15px;"></div></div>' +
+    '<div style="margin-top:10px;border-top:1px solid #164e63;padding-top:8px;">' +
+    '<b style="font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#a5f3fc;">➕ Add any product</b>' +
     '<div style="font-size:11px;color:#94a3b8;">Any ship, package or vehicle — paste its RSI page URL. No code editing.</div>' +
-    '<input id="scab-add-url" placeholder="Product URL — paste from the RSI store" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
-    '<input id="scab-add-name" placeholder="Name (optional — filled in from the URL)" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
+    '<input id="scab-add-url" placeholder="Product URL — paste from the RSI store" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;">' +
+    '<input id="scab-add-name" placeholder="Name (optional — filled in from the URL)" style="width:100%;box-sizing:border-box;margin-top:6px;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;">' +
     '<div style="display:flex;gap:6px;margin-top:6px;">' +
-    '<input id="scab-add-price" type="number" min="1" step="0.01" placeholder="Max price $" style="flex:1;min-width:0;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;">' +
-    '<input id="scab-add-list" placeholder="List ID (optional, e.g. 72)" style="flex:1;min-width:0;padding:6px;background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;"></div>' +
+    '<input id="scab-add-price" type="number" min="1" step="0.01" placeholder="Max price $" style="flex:1;min-width:0;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;">' +
+    '<input id="scab-add-list" placeholder="List ID (optional, e.g. 72)" style="flex:1;min-width:0;padding:6px;background:#0b1220;color:#e2e8f0;border:1px solid rgba(34,211,238,.45);border-radius:4px;"></div>' +
     '<label style="display:block;margin-top:6px;font-size:12px;"><input type="checkbox" id="scab-add-warbond"> Prefer Warbond (cheaper version first)</label>' +
-    '<button id="scab-add-btn" style="width:100%;margin-top:6px;padding:7px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;">Add product</button>' +
+    '<button id="scab-add-btn" style="width:100%;margin-top:6px;padding:8px;border:0;background:linear-gradient(135deg,#16a34a,#4ade80);color:#04120a;font-weight:800;letter-spacing:.5px;cursor:pointer;clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);">Add product</button>' +
     '<div id="scab-add-msg" style="font-size:12px;margin-top:4px;min-height:16px;"></div>' +
     '<div style="font-size:11px;color:#94a3b8;">List ID: ships use 72 (Standalone Ships) — with it, the bot also checks by API from any page. Leave it empty and the product is "page only": keep its page open in a tab, the bot watches its Buy Now button there.</div></div>' +
     '<label style="display:block;margin-top:8px;font-size:12px;"><input type="checkbox" id="scab-autopay"> ⚠️ Auto-Pay / Place Order — ON = the bot places the order itself (express checkout too: Jump to bottom → Terms → Place order). OFF = bot stops at payment.</label>' +
     '<div style="font-size:11px;color:#94a3b8;margin-top:6px;">API checks only — the page is never refreshed. Pauses on CAPTCHA / queue. Max price is a hard cap. No purchase is guaranteed. On the express checkout page, Start runs the checkout walk (Jump to bottom → Terms → Place order). Drag the header to move the panel, the corner to resize (double-click the header to reset).</div>' +
-    '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
-    '<div id="scab-resize-grip" title="Drag to resize the panel" style="position:absolute;right:2px;bottom:2px;width:18px;height:18px;cursor:nwse-resize;touch-action:none;display:flex;align-items:flex-end;justify-content:flex-end;color:#64748b;font-size:13px;line-height:1;z-index:2;">↘</div>';
+    '<div id="scab-log" style="margin-top:8px;max-height:180px;overflow:auto;background:#020617;border:1px solid #164e63;color:#7dd3fc;border-radius:6px;padding:8px;font:11px/1.5 monospace;"></div>' +
+    '<div id="scab-resize-grip" title="Drag to resize the panel" style="position:absolute;right:2px;bottom:2px;width:18px;height:18px;cursor:nwse-resize;touch-action:none;display:flex;align-items:flex-end;justify-content:flex-end;color:#22d3ee;font-size:13px;line-height:1;z-index:2;">↘</div>';
   document.body.appendChild(panel);
 
   renderWatchlist();
   bindWatchlistForm();
+  bindDelayInputs(); // v1.3.6: Min/Max check-speed inputs
 
   const payBox = document.getElementById('scab-autopay');
   payBox.checked = !!BOT.config.autoPay;
@@ -2231,7 +2306,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     DEFAULT_CONFIG, parseShipNameFromUrl, priceUsd, stockState, withinCap,
     findTargetSku, buildStockQuery, parseStockResponse, buildAddToCartMutation,
-    buildNextStepMutation, nextDelayMs, detectBlocker, availabilityFromJsonLd,
+    buildNextStepMutation, nextDelayMs, normalizePollDelays, detectBlocker, availabilityFromJsonLd,
     randInt, randomPointInRect, humanPath, BUY_NOW_SELECTORS, isClickableEl,
     slugify, isWatchedPage, findBuyNowButton,
     entryMatchesPage, isRsiUrl, normalizeWatchEntry, isApiCheckable,
@@ -2252,6 +2327,6 @@ if (typeof module !== 'undefined' && module.exports) {
     clickReacted, waitForClickReaction,
     pageRoute, watchUrlChanges,
     clampPct, applyPanelGeometry, savePanelGeometry, resetPanelGeometry,
-    startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, buildPanel,
+    startLoop, stopLoop, testStockCheck, renderWatchlist, bindWatchlistForm, bindDelayInputs, buildPanel,
   };
 }
